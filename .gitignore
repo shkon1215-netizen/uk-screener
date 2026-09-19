@@ -1,0 +1,21 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Fetch cache — per-day, per-machine, rebuilt on demand
+.uk_cache/
+
+# Generated results and dashboards. The Actions workflow regenerates these on
+# every run, so committing them only creates merge noise and stale data.
+uk_screen_results.csv
+uk_screen_results_meta.json
+aim_screen_results.csv
+aim_screen_results_meta.json
+uk_dashboard.html
+aim_dashboard.html
+site/
+
+# Scratch
+_roster.csv
+_patch_*.py
