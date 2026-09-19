@@ -7,7 +7,7 @@ absolute terms.
 **Defaults:** market cap ≥ USD 600M (~£440M) · median daily traded value ≥
 USD 4M · ≥20% below peer median on ≥2 of 3 metrics · ROE ≥ 5%.
 
-Ported from the [Korea screener](../Korea). `screener.py` is unchanged — the
+Ported from the [Korea screener](https://github.com/shkon1215-netizen/korea-screener). `screener.py` is unchanged — the
 relative-valuation maths does not care which market it points at. What was
 rewritten is the data layer and the local share-class hygiene.
 
