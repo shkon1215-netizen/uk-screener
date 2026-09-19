@@ -216,6 +216,20 @@ Two consequences:
    (8). This is the same shape as Korea's KOSDAQ problem, milder. Lowering
    `--min-peers` does not fix it, it just benchmarks against noise.
 
+3. **`--board AIM` is not the same as AIM inside a `BOTH` run, and the AIM
+   page is the weaker of the two readings.** Run together, an AIM name whose
+   own board cohort is too thin falls back to `industry` alone — which then
+   contains Main Market companies, and that is a legitimate comparison for
+   the 25 AIM names large enough to be here. Cohort plc clears the relative
+   screen that way. Run alone, the fallback has only 25 rows to draw on, no
+   industry reaches five peers, and **nothing passes either screen at all**.
+
+   So the zero on the published AIM page is mostly an artefact of screening
+   25 names in isolation, not a finding about AIM. The board comparison above
+   is taken from the combined run for exactly this reason. If the AIM page
+   ever matters more than it does now, screen it with `--peer-keys industry`
+   inside a full run rather than with `--board AIM`.
+
 ## Publishing
 
 `.github/workflows/screen.yml` runs both boards at 17:00 UTC on weekdays,

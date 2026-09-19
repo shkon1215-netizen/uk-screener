@@ -66,7 +66,10 @@ def _records(df: pd.DataFrame) -> list[dict]:
     out = []
     for _, r in df.iterrows():
         out.append({
-            "ticker": str(r.get("ticker", "")),
+            # The TIDM, not the Yahoo symbol: SHEL is what a UK reader looks
+            # up, SHEL.L is a vendor detail. This key must stay in step with
+            # TABLE_COLS - see the guard in cell() for what a mismatch costs.
+            "tidm": str(r.get("tidm", "") or r.get("ticker", "")),
             "name": str(r.get("name", "")),
             "board": str(r.get("board", "")),
             "industry": "" if pd.isna(r.get("industry")) else str(r.get("industry")),
@@ -924,7 +927,12 @@ const esc = (s) => String(s).replace(/[&<>"]/g, c =>
 
 function cell(r, k) {
   const v = r[k];
-  if (k === "ticker") return `<span style="color:var(--ink-3)">${esc(v)}</span>`;
+  /* A key present in TABLE_COLS but absent from the row payload arrives as
+     undefined, which is not null and so slipped past the guard below and hit
+     .toFixed() - one renamed column threw on the first row and left the whole
+     table empty with no visible error. Missing reads as missing. */
+  if (v === undefined) return '<span class="na">—</span>';
+  if (k === "tidm") return `<span style="color:var(--ink-3)">${esc(v)}</span>`;
   if (k === "name") {
     const tags = (r.holdco ? '<span class="tag">holdco</span>' : "")
                + (r.pbr20 ? '<span class="tag">pbr b20</span>' : "");
@@ -975,7 +983,7 @@ function render() {
     if (scr && r.ev.screen !== scr) return false;
     if (noHold && r.holdco) return false;
     if (brd && r.board !== brd) return false;
-    if (q && !(r.name.toLowerCase().includes(q) || r.ticker.includes(q)
+    if (q && !(r.name.toLowerCase().includes(q) || (r.tidm || "").toLowerCase().includes(q)
         || (r.industry || "").toLowerCase().includes(q))) return false;
     return true;
   });
