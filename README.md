@@ -85,14 +85,19 @@ dropped.
 ## Two independent screens
 
 The **relative** screen asks whether a name is cheap against its own industry
-peers. The **absolute** screen ignores the neighbours: P/B < 1, EV/EBITDA < 8,
-P/B below fair value (ROE ÷ cost of equity), dividend yield ≥ 2%, ROE ≥ 5%.
+peers. The **absolute** screen ignores the neighbours: P/B < 1.42,
+EV/EBITDA < 7.5, P/B below fair value (ROE ÷ cost of equity), dividend
+yield ≥ 2%, ROE ≥ 5%.
+
+Those first two are the **cheapest quartile of this universe**, measured rather
+than inherited — Korea's P/B < 1 does not transfer, because UK median P/B is
+2.43 against KOSPI's 1.15. See `config_uk.py` for the percentile table.
 
 Neither gates the other; results are unioned and a `screen` column records
 which one each name cleared. Financials clear the absolute screen on P/B + ROE
 alone, because enterprise value is meaningless for a bank — on the reference
-run **all five absolute passes came through that carve-out**, so the strict
-reading would have returned nothing.
+run 9 of 10 absolute passes came through that carve-out, so the strict
+reading would have returned one name.
 
 ## What differs from the Korea build
 

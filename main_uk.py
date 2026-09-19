@@ -43,10 +43,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-liquidity", action="store_true")
     p.add_argument("--min-roe", type=float, default=5.0,
                    help="ROE%% floor applied to survivors; 0 disables")
-    p.add_argument("--abs-pbr", type=float, default=1.0,
-                   help="absolute screen: P/B below this")
-    p.add_argument("--abs-ev", type=float, default=8.0,
-                   help="absolute screen: EV/EBITDA below this")
+    # These mirror config_uk.ScreenConfig and are the defaults that actually
+    # govern, because main() passes every one of them into the dataclass - a
+    # value changed there but not here would be silently overridden.
+    p.add_argument("--abs-pbr", type=float, default=1.42,
+                   help="absolute screen: P/B below this (default 1.42 = the "
+                        "cheapest quartile of the UK universe; see config_uk)")
+    p.add_argument("--abs-ev", type=float, default=7.5,
+                   help="absolute screen: EV/EBITDA below this (default 7.5 = "
+                        "cheapest quartile)")
     p.add_argument("--abs-strict-financials", action="store_true",
                    help="require EV/EBITDA of financials too (they have none, so "
                         "none will pass)")

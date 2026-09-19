@@ -97,9 +97,9 @@ build is a *silent* one — see "Likely first failures".
 
 7. **EV/EBITDA is suppressed for financials**, and financials therefore clear
    the absolute screen on P/B + ROE alone (`abs_financials_pbr_only`). On the
-   reference run **all 5 absolute passes came via that carve-out** — a strict
-   both-metrics rule would have returned zero. `--abs-strict-financials`
-   restores the strict reading.
+   reference run **9 of 10 absolute passes came via that carve-out** — a
+   strict both-metrics rule would have returned one name (FirstGroup).
+   `--abs-strict-financials` restores the strict reading.
 
 8. **The ROE floor runs after scoring, never before.** It narrows `passes` and
    leaves `avg_discount` alone, so peer cohorts still contain the low-ROE
@@ -109,7 +109,18 @@ build is a *silent* one — see "Likely first failures".
 9. **Two independent screens**, unioned into `passes_any`; `screen` records
    which one a name cleared. Neither gates the other.
 
-10. **Yahoo results are cached per session date.** Not an optimisation — see
+10. **The absolute screen's multiples are calibrated to the UK, the quality
+    floor is not.** `abs_max_pbr` 1.42 and `abs_max_ev_ebitda` 7.5 are the
+    cheapest quartile of this universe, measured on the 2026-08-28 run;
+    Korea's 1.0 and 8.0 do not transfer, because UK median P/B is 2.43 against
+    KOSPI's 1.15. `min_roe_pct` stays at 5% and `abs_min_div_yield` at 2%
+    because those encode a preference rather than a market level. The
+    percentile table lives on `ScreenConfig.abs_max_pbr` and should be
+    re-measured if the universe or the size floor changes - a threshold set to
+    a percentile is only meaningful against the distribution it was drawn
+    from.
+
+11. **Yahoo results are cached per session date.** Not an optimisation — see
     "Likely first failures". Removing the cache makes the universe vary
     silently between runs.
 

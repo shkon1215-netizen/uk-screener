@@ -1,9 +1,13 @@
 """Configuration for the UK (LSE) valuation screener.
 
-Thresholds are carried over from the Korea build unchanged - they are the
-user's screening preferences, not a Korea-specific calibration. What differs
-here is entirely universe hygiene: the vehicles that are structurally cheap on
-the London market are not the ones that are structurally cheap in Seoul.
+Two things differ from the Korea build. Universe hygiene, because the
+vehicles that are structurally cheap in London are not the ones that are
+structurally cheap in Seoul. And the absolute screen's valuation thresholds,
+which were measured against the UK distribution rather than carried over -
+see the percentile table on ScreenConfig.abs_max_pbr.
+
+The quality floor and the discount test ARE carried over unchanged: those are
+the user's screening preferences, not a market calibration.
 """
 from __future__ import annotations
 
@@ -46,14 +50,41 @@ class ScreenConfig:
     roe_good_pct: float = 10.0
 
     # --- Absolute value screen ---
-    abs_max_pbr: float = 1.0
-    abs_max_ev_ebitda: float = 8.0
+    # CALIBRATED TO THE UK, not inherited from Korea. Measured on the 253 names
+    # past the USD 600m gate (2026-08-28 run, investment trusts removed):
+    #
+    #   metric        p10     p25   median     p75
+    #   P/E           9.2    13.2     18.1    26.0
+    #   P/B          0.92    1.42     2.43    4.20
+    #   EV/EBITDA     4.5     7.5      9.7    14.3
+    #   yield        5.8%    4.1%     2.8%    1.8%
+    #
+    # Korea's P/B < 1 and EV/EBITDA < 8 do not transfer. UK median P/B is 2.43
+    # against KOSPI's 1.15 - this universe is index large/mid caps skewed to
+    # asset-light, high-ROE businesses, and removing 116 investment trusts took
+    # out the block of names that sat near book. So P/B < 1 was silently a ~p10
+    # deep-value test while the yield and ROE floors passed 69% and 80% of the
+    # universe. Three near-no-ops behind one very strict test is not a screen,
+    # it is one test wearing a disguise.
+    #
+    # These two are the cheapest quartile of this universe, so the valuation
+    # tests are equally strict rather than accidentally two deciles apart.
+    abs_max_pbr: float = 1.42          # p25; was 1.0 under Korea parity
+    abs_max_ev_ebitda: float = 7.5     # p25; was 8.0 under Korea parity
     abs_require_roe: bool = True
     abs_financials_pbr_only: bool = True
 
+    # The test that actually binds: 26 of 253 clear P/B < ROE/CoE against 60
+    # for P/B < 1.42, so loosening P/B from 1.0 changed the pass count not at
+    # all. It is also the only test here that says WHY a low multiple is wrong
+    # rather than noting that it is low, which is why it stays on by default.
     abs_require_pbr_vs_roe: bool = True
     abs_cost_of_equity_pct: float = 10.0
 
+    # Left at 2%, which passes 69% of the universe and so barely filters. The
+    # cheapest-quartile equivalent is 4.1%, but raising it halves the result
+    # (10 names -> 5) by demanding income rather than cheapness, which is a
+    # different screen. Use --abs-min-div 4.1 for the income version.
     abs_min_div_yield: float = 2.0
 
     # --- Peer groups ---
