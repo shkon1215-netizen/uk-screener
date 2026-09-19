@@ -5,7 +5,8 @@ weekday after the LSE close
 
 Finds London Main Market and AIM stocks trading at a discount to their industry
 peers on P/E, P/B, and EV/EBITDA — and, independently, stocks that are cheap in
-absolute terms.
+absolute terms, and stocks that are cheap against their own filed history. Each
+row also carries three years of revenue, EBITDA and net profit.
 
 **Defaults:** market cap ≥ USD 600M (~£440M) · median daily traded value ≥
 USD 4M · ≥20% below peer median on ≥2 of 3 metrics · ROE ≥ 5%.
@@ -85,10 +86,14 @@ convergence. Excluded when the ordinary line is present in the same roster.
 **REITs and cash shells** are excluded; **holding companies** are flagged, not
 dropped.
 
-## Two independent screens
+## Three independent screens
 
 The **relative** screen asks whether a name is cheap against its own industry
-peers. The **absolute** screen ignores the neighbours: P/B < 1.42,
+peers. The **own-history** screen asks whether it is cheap against *itself*:
+at least 30% below the median of its last four filed years on at least two of
+P/E, P/B and EV/EBITDA, plus the ROE floor. It catches a premium company that has
+de-rated, which neither of the other two notice. The **absolute** screen ignores
+the neighbours: P/B < 1.42,
 EV/EBITDA < 7.5, P/B below fair value (ROE ÷ cost of equity), dividend
 yield ≥ 2%, ROE ≥ 5%.
 
@@ -96,8 +101,8 @@ Those first two are the **cheapest quartile of this universe**, measured rather
 than inherited — Korea's P/B < 1 does not transfer, because UK median P/B is
 2.43 against KOSPI's 1.15. See `config_uk.py` for the percentile table.
 
-Neither gates the other; results are unioned and a `screen` column records
-which one each name cleared. Financials clear the absolute screen on P/B + ROE
+None gates another; results are unioned and a `screen` column lists every
+one a name cleared. Financials clear the absolute screen on P/B + ROE
 alone, because enterprise value is meaningless for a bank — on the reference
 run 9 of 10 absolute passes came through that carve-out, so the strict
 reading would have returned one name.

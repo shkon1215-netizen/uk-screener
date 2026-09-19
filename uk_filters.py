@@ -267,12 +267,153 @@ def apply_absolute_screen(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[pd.Dat
     return df, stats
 
 
+HIST_METRICS = (("per", "trailing_pe"), ("pbr", "price_to_book"),
+                ("evx", "ev_to_ebitda"))
+
+
+def _as_list(v) -> list:
+    return list(v) if isinstance(v, (list, tuple, np.ndarray)) else []
+
+
+def add_history_now(df: pd.DataFrame) -> pd.DataFrame:
+    """Today's P/E, P/B and EV/EBITDA on the SAME basis as the history.
+
+    Each historical year is that year-end market value over that year's filed
+    totals (providers_uk.build_statement_record). Today's value has to be
+    built the same way - today's market value over the latest filing - or the
+    comparison measures the gap between two definitions rather than a change
+    in valuation.
+
+    That is not hypothetical. yfinance's own trailingPE divides by the last
+    twelve months, including interims: for Shell in Sept 2026 that gives 10.5
+    against 15.2 on the filed-year basis, a 31% gap that would read as a 31%
+    discount to history on its own. Korea learned the same lesson on
+    EV/EBITDA, where mixing providers put only 18 of 30 within +/-25%; its fix
+    was to rebuild the current value from the history's own source, which is
+    what this does.
+
+    So these three columns feed the own-history screen ONLY. The peer and
+    absolute screens keep yfinance's figures, because they compare companies
+    with each other on a common vendor definition, not a company with itself.
+
+    Out-of-bounds values become NaN here rather than in the screen, so the
+    dashboard receives exactly what Python tested and cannot disagree with it.
+    """
+    df = df.copy()
+    n = lambda c: pd.to_numeric(df.get(c), errors="coerce")  # noqa: E731
+    mv = n("market_cap_local") * n("fx_now")      # quote-major -> reporting ccy
+    ni, eq, eb = n("lf_ni"), n("lf_equity"), n("lf_ebitda")
+    mi = n("lf_mi").fillna(0.0)
+    df["per_now"] = (mv / ni).where(ni > 0)
+    df["pbr_now"] = (mv / eq).where(eq > 0)
+    df["evx_now"] = ((mv + n("lf_debt") - n("lf_cash") + mi) / eb).where(eb > 0)
+    fin = df.get("sector", pd.Series("", index=df.index)).fillna("") \
+            .str.contains("Financial", case=False)
+    df.loc[fin, "evx_now"] = np.nan          # invariant 6
+    for col, (_, bound_key) in zip(("per_now", "pbr_now", "evx_now"), HIST_METRICS):
+        lo, hi = K.METRIC_BOUNDS[bound_key]
+        df[col] = df[col].where((df[col] >= lo) & (df[col] <= hi))
+    return df
+
+
+def apply_history_screen(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[pd.DataFrame, dict]:
+    """Cheap against the company's own filed history - the third screen.
+
+    A port of the Korea build's apply_history_screen, held to the same rules:
+    the benchmark is a median (invariant 4); a non-positive or out-of-bounds
+    multiple is missing, never cheap, in history as well as today
+    (invariant 2), so a loss year drops out of the benchmark rather than
+    dragging it; EV/EBITDA is skipped for financials (invariant 6); fewer than
+    `hist_min_years` usable years is no benchmark; the ROE floor applies.
+
+    One difference, and it is a data limit rather than a choice: Yahoo carries
+    FOUR filed years for UK companies where WiseReport gave Korea five, so the
+    benchmark is a four-year median. Every name checked has a fifth column,
+    and it is empty in every one.
+    """
+    df = add_history_now(df)
+    fin = df.get("sector", pd.Series("", index=df.index)).fillna("") \
+            .str.contains("Financial", case=False)
+
+    disc_cols = []
+    for key, bound_key in HIST_METRICS:
+        lo, hi = K.METRIC_BOUNDS[bound_key]
+        vals = df.get(f"hist_{key}", pd.Series([[]] * len(df), index=df.index)) \
+                 .map(_as_list)
+        for i in range(5):
+            df[f"hist_{key}_y{i + 1}"] = vals.map(
+                lambda v, i=i: v[i] if i < len(v) and v[i] is not None else np.nan)
+
+        def bench(v):
+            ok = [float(x) for x in v if x is not None and np.isfinite(float(x))
+                  and lo <= float(x) <= hi]
+            return float(np.median(ok)) if len(ok) >= cfg.hist_min_years else np.nan
+
+        med = vals.map(bench)
+        if key == "evx":
+            med = med.where(~fin)
+        cur = df[f"{key}_now"]
+        df[f"hist_{key}_med"] = med
+        df[f"hist_{key}_disc"] = (med - cur) / med
+        disc_cols.append(f"hist_{key}_disc")
+
+    discs = df[disc_cols]
+    df["hist_n_valid"] = discs.notna().sum(axis=1)
+    df["hist_n_pass"] = (discs >= cfg.hist_min_discount).sum(axis=1)
+    # Averages every metric with data, including the failing ones - the same
+    # rule as avg_discount (invariant 5).
+    df["hist_avg_disc"] = discs.mean(axis=1, skipna=True)
+
+    roe_ok = df.get("roe_ok", pd.Series(True, index=df.index)).fillna(False).astype(bool)
+    hp = df["hist_n_pass"] >= cfg.hist_min_metrics
+    if cfg.hist_require_roe:
+        hp = hp & roe_ok
+    df["hist_passes"] = hp
+
+    # Three screens now, so `screen` names every one a row cleared.
+    rel = df["passes"].astype(bool)
+    absp = df.get("abs_passes", pd.Series(False, index=df.index)).astype(bool)
+    parts = pd.DataFrame({"relative": rel, "absolute": absp, "history": hp})
+    df["screen"] = parts.apply(lambda r: " + ".join(k for k, v in r.items() if v), axis=1)
+    df["passes_any"] = rel | absp | hp
+
+    note = df.get("hist_note", pd.Series("", index=df.index)).fillna("")
+    stats = {
+        "hist_with_benchmark": int((df["hist_n_valid"] > 0).sum()),
+        # Every name a guard refused a benchmark, by reason - so a data problem
+        # shows up as a count in the funnel rather than as names quietly
+        # missing from the third screen.
+        "hist_share_break": int((note == "share-count break").sum()),
+        "hist_basis_mismatch": int((note == "price/share basis mismatch").sum()),
+        "hist_stale_filing": int((note == "stale filings").sum()),
+        "hist_no_reporting_ccy": int((note == "no reporting currency").sum()),
+        "hist_normalized_earnings": int((df.get("hist_earnings", pd.Series("", index=df.index))
+                                         == "normalized").sum()),
+        f"hist_passing_{cfg.hist_min_discount:.0%}": int(hp.sum()),
+        "hist_new_vs_other_screens": int((hp & ~rel & ~absp).sum()),
+        "passing_any_screen": int(df["passes_any"].sum()),
+    }
+    df = df.sort_values(["passes_any", "avg_discount"], ascending=[False, False])
+    return df, stats
+
+
 def uk_output_columns(cfg: K.ScreenConfig) -> list[str]:
     cols = ["ticker", "tidm", "name", "board", "tier", "sector", "industry",
             "icb_sector", "market_cap_usd", "adv_usd", "close_local", "currency"]
     for m in cfg.metrics:
         cols += [m, f"{m}_peer_median", f"{m}_discount",
                  f"{m}_peer_n", f"{m}_pct_rank"]
+    # Own filed history: today's same-basis values, the median benchmark, the
+    # discount to it, and each year's value for the tooltip.
+    cols += ["hist_years", "hist_note", "hist_earnings", "per_now", "pbr_now", "evx_now",
+             "hist_n_valid", "hist_n_pass", "hist_avg_disc", "hist_passes"]
+    for m in ("per", "pbr", "evx"):
+        cols += [f"hist_{m}_med", f"hist_{m}_disc"]
+        cols += [f"hist_{m}_y{i}" for i in range(1, 6)]
+    # Three-year history: millions of the REPORTING currency, oldest first.
+    cols += ["fin_years", "fin_n", "fin_ccy"]
+    for m in ("rev", "op", "ebitda", "np"):
+        cols += [f"{m}_y1", f"{m}_y2", f"{m}_y3", f"{m}_cagr"]
     cols += ["screen", "passes_any", "abs_passes", "abs_pbr_ok", "abs_ev_ok",
              "abs_pbr_vs_roe_ok", "abs_div_ok", "abs_roe_ok", "abs_fair_pbr",
              "abs_via_carveout",

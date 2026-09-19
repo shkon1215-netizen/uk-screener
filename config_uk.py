@@ -87,6 +87,20 @@ class ScreenConfig:
     # different screen. Use --abs-min-div 4.1 for the income version.
     abs_min_div_yield: float = 2.0
 
+    # --- Own-history screen ---
+    # Cheap against the company's OWN filed years, not its peers or a fixed
+    # level. Same parameters as the Korea build. The benchmark is a median for
+    # the same reason peer medians are (invariant 4): one freak year - Shell's
+    # 4.6x P/E on 2022's record profits - would drag a mean far enough to make
+    # an ordinary year look expensive.
+    #
+    # Yahoo holds FOUR filed years for UK names (Korea's WiseReport had five),
+    # so hist_min_years = 3 means three of four must be usable.
+    hist_min_discount: float = 0.30
+    hist_min_metrics: int = 2       # of P/E, P/B, EV/EBITDA; financials have no EV/EBITDA
+    hist_min_years: int = 3         # below this there is no history, only noise
+    hist_require_roe: bool = True   # same floor as the other two screens
+
     # --- Peer groups ---
     # Korea used industry x board because KOSDAQ carries structurally richer
     # multiples than KOSPI. The UK analogue is Main Market vs AIM, and the

@@ -169,8 +169,191 @@ def check_units() -> list[str]:
     return bad
 
 
+# ---------------------------------------------------------------------------
+# Filed statements: the three-year history and the own-history screen
+# ---------------------------------------------------------------------------
+YEARS = pd.to_datetime(["2021-12-31", "2022-12-31", "2023-12-31",
+                        "2024-12-31", "2025-12-31"])
+
+
+def stmt(rows: dict) -> pd.DataFrame:
+    """A Yahoo-shaped statement: rows are line items, columns are fiscal
+    year-ends NEWEST first, and the oldest column is entirely empty - exactly
+    the padding Yahoo returns for every UK name checked."""
+    df = pd.DataFrame({k: [np.nan] + list(v) for k, v in rows.items()},
+                      index=YEARS).T
+    return df[df.columns[::-1]]
+
+
+def company(ni=(100e6, 110e6, 120e6, 130e6), shares=(1e9,) * 4,
+            eq=(1000e6,) * 4, ebitda=(200e6, 210e6, 220e6, 230e6)):
+    inc = stmt({"Total Revenue": (1000e6, 1100e6, 1200e6, 1300e6),
+                "Operating Income": (150e6, 160e6, 170e6, 180e6),
+                "EBITDA": ebitda, "Net Income Common Stockholders": ni})
+    bs = stmt({"Common Stock Equity": eq, "Ordinary Shares Number": shares,
+               "Total Debt": (300e6,) * 4, "Cash And Cash Equivalents": (100e6,) * 4})
+    return inc, bs
+
+
+def prices(pence: float) -> pd.Series:
+    idx = pd.date_range("2020-01-01", "2026-09-18", freq="B")
+    return pd.Series(pence, index=idx)
+
+
+def check_statements() -> list[str]:
+    from providers_uk import build_statement_record, cagr
+    bad = []
+    print("\n=== filed statements ===")
+
+    def ok(cond, label):
+        print(f"  {'OK  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            bad.append(label)
+
+    # A GBP reporter at 200p a share, 1bn shares: GBP 2bn market value every
+    # year-end, against GBP 1bn of equity - so P/B 2.0 in every year.
+    inc, bs = company()
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_years"] == "2022,2023,2024,2025",
+       "Yahoo's empty padded year is not read as a filed year")
+    ok(rec["hist_pbr"] == [2.0] * 4, f"P/B history built in pounds, not pence ({rec['hist_pbr']})")
+    ok(rec["fin_years"] == "2023,2024,2025" and rec["rev_y3"] == 1300.0,
+       "3-year history is the last three filed years, in millions")
+    ok(abs(rec["rev_cagr"] - ((1300 / 1100) ** 0.5 - 1)) < 1e-9, "revenue CAGR over the span covered")
+    ok(np.isnan(cagr([-50, 10, 20])), "CAGR is undefined on a negative base, not sign-flipped")
+
+    # A DOLLAR reporter quoted in pence - the Shell/Rio shape. GBP 2bn of
+    # market value at 1.25 USD/GBP is USD 2.5bn against USD 1bn of equity:
+    # P/B 2.5. Forgetting the conversion reads 2.0, a fake 20% discount.
+    fx = pd.Series(1.25, index=prices(1).index)
+    rec = build_statement_record(inc, bs, prices(200.0), fx, "GBp", "USD",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_pbr"] == [2.5] * 4, f"USD reporter converted at each year-end rate ({rec['hist_pbr']})")
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "USD",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(all(v is None for v in rec["hist_pbr"]),
+       "USD reporter with no FX history gets NO benchmark, never an unconverted one")
+    # Yahoo left out the reporting currency. Assuming sterling would scale a
+    # dollar reporter's whole history by the exchange rate.
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_note"] == "no reporting currency" and rec["hist_pbr"] == [],
+       "missing reporting currency -> no benchmark, never assumed to be sterling")
+    ok(rec["rev_y3"] == 1300.0, "...while the 3-year history still ships")
+
+    # A 1-for-10 consolidation between 2023 and 2024: share count drops 10x.
+    inc2, bs2 = company(shares=(1e9, 1e9, 1e8, 1e8))
+    rec = build_statement_record(inc2, bs2, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e8)
+    ok(rec["hist_note"] == "share-count break" and rec["hist_pbr"] == [],
+       "share consolidation -> no history, not a 90% 'discount'")
+
+    # Price series and filed shares on different bases: today's price x latest
+    # shares is 10x today's market cap.
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e8)
+    ok(rec["hist_note"] == "price/share basis mismatch" and rec["hist_per"] == [],
+       "price/share basis mismatch -> no history")
+
+    # A one-off gain in the latest year - the Reckitt shape. Reported net
+    # income doubles; Yahoo's normalized line does not. The valuation must use
+    # normalized, or the one-off reads as the stock halving its P/E.
+    inc4, bs4 = company(ni=(100e6, 100e6, 100e6, 200e6))
+    inc4.loc["Normalized Income"] = inc4.loc["Net Income Common Stockholders"]
+    inc4.loc["Normalized Income", YEARS[-1]] = 100e6
+    inc4.loc["Normalized EBITDA"] = inc4.loc["EBITDA"]
+    rec = build_statement_record(inc4, bs4, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_earnings"] == "normalized" and rec["lf_ni"] == 100e6
+       and rec["hist_per"][-1] == 20.0,
+       "one-off gain: valuation uses normalized earnings, today and in history")
+    ok(rec["np_y3"] == 200.0, "...while the 3-year history still reports what happened")
+
+    # Normalized present for only some years: do not mix definitions.
+    inc5, bs5 = company()
+    inc5.loc["Normalized Income"] = np.nan
+    inc5.loc["Normalized Income", YEARS[-1]] = 130e6
+    rec = build_statement_record(inc5, bs5, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_earnings"] == "reported",
+       "normalized for only part of the window -> reported throughout, never mixed")
+
+    # Stale latest filing: FY2025 is the newest Yahoo has, and it is 2027.
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9, asof="2027-12-31")
+    ok(rec["hist_note"] == "stale filings" and rec["hist_per"] == [],
+       "latest filing 2 years old -> no benchmark")
+    rec = build_statement_record(inc, bs, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9, asof="2026-09-18")
+    ok(rec["hist_note"] == "", "latest filing 9 months old -> benchmark kept")
+
+    # A loss year: P/E for that year is missing, not negative or cheap.
+    inc3, bs3 = company(ni=(100e6, -50e6, 120e6, 130e6))
+    rec = build_statement_record(inc3, bs3, prices(200.0), None, "GBp", "GBP",
+                                 close_now=2.0, mcap_now=2e9)
+    ok(rec["hist_per"][1] is None, "loss year's P/E is missing, not negative")
+    return bad
+
+
+def check_history_screen() -> list[str]:
+    bad = []
+    print("\n=== own-history screen ===")
+    cfg = ScreenConfig()
+
+    def row(tidm, pers, pbrs, evxs, now_mcap, lf_ni=100e6, lf_eq=1000e6,
+            lf_eb=200e6, sector="Industrials", roe_ok=True):
+        return dict(tidm=tidm, ticker=tidm + ".L", sector=sector,
+                    hist_per=pers, hist_pbr=pbrs, hist_evx=evxs,
+                    market_cap_local=now_mcap, fx_now=1.0, lf_ni=lf_ni,
+                    lf_equity=lf_eq, lf_ebitda=lf_eb, lf_debt=300e6,
+                    lf_cash=100e6, lf_mi=0.0, passes=False, abs_passes=False,
+                    roe_ok=roe_ok, avg_discount=0.0, hist_note="")
+
+    df = pd.DataFrame([
+        # De-rated premium name: always ~20x, 2x book, 10x EBITDA; now 10x,
+        # 1.0x, ~6x. Cheap against itself on all three, and nothing else flags it.
+        row("DRTD", [20, 21, 19, 20], [2.0, 2.1, 1.9, 2.0], [10, 11, 9, 10], 1.0e9),
+        # Same history, same price, but ROE below the floor.
+        row("LOWR", [20, 21, 19, 20], [2.0, 2.1, 1.9, 2.0], [10, 11, 9, 10], 1.0e9,
+            roe_ok=False),
+        # Only two usable years: no benchmark, however cheap it looks.
+        row("THIN", [20, None, None, 21], [2.0, None, None, 2.1],
+            [10, None, None, 11], 1.0e9),
+        # A freak year (150x P/E, inside the bounds so only the median can stop
+        # it) must not drag the benchmark: the mean would be 46, the median 12.
+        row("FREK", [150, 12, 11, 12], [1.2, 1.1, 1.2, 1.1], [7, 6, 7, 6], 1.2e9),
+        # A bank: EV/EBITDA must be skipped even though the numbers exist.
+        row("BANK", [20, 21, 19, 20], [2.0, 2.1, 1.9, 2.0], [10, 11, 9, 10], 1.0e9,
+            sector="Financial Services"),
+    ])
+    res, stats = UF.apply_history_screen(df, cfg)
+    idx = res.set_index("tidm")
+
+    def ok(cond, label):
+        print(f"  {'OK  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            bad.append(label)
+
+    d = idx.loc["DRTD"]
+    ok(bool(d["hist_passes"]) and d["screen"] == "history",
+       f"de-rated premium name passes on history alone (n_pass={d['hist_n_pass']})")
+    ok(abs(d["per_now"] - 10.0) < 1e-9 and abs(d["pbr_now"] - 1.0) < 1e-9,
+       "today is measured on the history's basis: market value / latest filing")
+    ok(not bool(idx.loc["LOWR", "hist_passes"]), "ROE floor applies to the history screen")
+    ok(idx.loc["THIN", "hist_n_valid"] == 0, "fewer than 3 usable years -> no benchmark")
+    ok(abs(idx.loc["FREK", "hist_per_med"] - 12.0) < 1e-9,
+       f"freak year does not drag the benchmark (median {idx.loc['FREK', 'hist_per_med']})")
+    b = idx.loc["BANK"]
+    ok(pd.isna(b["hist_evx_med"]) and pd.isna(b["evx_now"]),
+       "financials: EV/EBITDA skipped in history and today")
+    return bad
+
+
 def main() -> int:
     failures = check_units()
+    failures += check_statements()
+    failures += check_history_screen()
 
     cfg = ScreenConfig()
     df = make_universe()

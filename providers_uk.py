@@ -51,11 +51,13 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import io
+import json
 import logging
 import os
 import re
 import time
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -85,6 +87,11 @@ SNAPSHOT_FIELDS = (
     "trailing_pe", "price_to_book", "ev_to_ebitda", "trailing_eps",
     "book_value_ps", "div_yield", "sector", "industry", "country",
     "quote_type", "yf_shares",
+    # The currency the ACCOUNTS are in, which is not the quote currency for a
+    # large slice of the London market: Shell, Rio, HSBC, Glencore and BP all
+    # trade in pence and report in US dollars. Anything that divides a market
+    # value by a reported figure needs both, and needs them converted.
+    "fin_ccy",
 )
 
 
@@ -157,7 +164,6 @@ def fetch_investment_companies() -> dict[str, dict]:
         log.warning("AIC register: unbalanced array")
         return {}
     try:
-        import json
         arr = json.loads(html[start:end])
     except Exception as e:
         log.warning("AIC register: JSON parse failed: %s", e)
@@ -354,6 +360,15 @@ class LSEProvider:
                              len(cached), os.path.basename(path), age_h)
                 except Exception as e:
                     log.warning("  cache unreadable (%s), refetching", e)
+                # A cache written before a field was added has that column
+                # missing, and reindexing would quietly fill it with NaN for
+                # every cached row - "all tickers served from cache" with a
+                # field that nothing downstream can use. Discard it instead.
+                stale = [f for f in SNAPSHOT_FIELDS if f not in cached.columns]
+                if stale and not cached.empty:
+                    log.info("  cache predates field(s) %s - refetching",
+                             ", ".join(stale))
+                    cached = pd.DataFrame()
 
         have = set()
         if not cached.empty and "market_cap_local" in cached.columns:
@@ -427,6 +442,7 @@ class LSEProvider:
                 "country": i.get("country"),
                 "quote_type": i.get("quoteType"),
                 "yf_shares": i.get("sharesOutstanding"),
+                "fin_ccy": i.get("financialCurrency"),
             })
             return rec
 
@@ -513,3 +529,388 @@ class LSEProvider:
         log.warning("FX: both live sources failed, using the hardcoded 1.27. "
                     "The USD size gate is only as good as this number.")
         return 1.27
+
+
+# ---------------------------------------------------------------------------
+# Filed statements: three-year history and the own-history benchmark
+# ---------------------------------------------------------------------------
+# Row names Yahoo uses in its annual statements, first match wins. Net income
+# is taken to COMMON shareholders where Yahoo separates it: NatWest's differs
+# by ~6% because of AT1 coupons, and a P/E is a price for the common equity.
+IS_ROWS = {
+    "rev": ("Total Revenue", "Operating Revenue"),
+    "op": ("Operating Income", "Total Operating Income As Reported"),
+    "ebitda": ("EBITDA", "Normalized EBITDA"),
+    "np": ("Net Income Common Stockholders", "Net Income"),
+    # Yahoo's "normalized" lines strip exactly its Total Unusual Items row. The
+    # 3-year growth history stays on the REPORTED rows above, as Korea's does
+    # - that is what happened. The own-history VALUATION uses these instead,
+    # because a one-off is not a change in what the business is worth: Reckitt
+    # sold Essential Home in 2025, reported EBITDA jumped 4,760 vs 3,966
+    # normalized and net income 3,182 vs 2,535, and on reported figures it
+    # passed the history screen on P/E and EV/EBITDA while its P/B - which a
+    # disposal gain does not move - sat only 15% below its history. For an
+    # ordinary year the two lines agree to within a few percent.
+    "np_norm": ("Normalized Income",),
+    "ebitda_norm": ("Normalized EBITDA",),
+}
+BS_ROWS = {
+    "equity": ("Common Stock Equity", "Stockholders Equity"),
+    "shares": ("Ordinary Shares Number", "Share Issued"),
+    "debt": ("Total Debt",),
+    "cash": ("Cash And Cash Equivalents",
+             "Cash Cash Equivalents And Short Term Investments"),
+    "mi": ("Minority Interest",),
+}
+
+# Quote currencies Yahoo reports in minor units, and the major unit each is.
+MINOR_CCY = {"GBp": ("GBP", 100.0), "GBX": ("GBP", 100.0),
+             "ZAc": ("ZAR", 100.0), "ILA": ("ILS", 100.0)}
+
+# Consecutive filed share counts outside this band are treated as a corporate
+# action (consolidation, split, rights issue) rather than buybacks. Shell's
+# heavy buybacks move ~7% a year, so the band is wide enough to leave them
+# alone. It cannot catch small consolidations; it catches the ones that would
+# otherwise manufacture a 30%+ "discount" out of a unit change.
+SHARE_BREAK_BAND = (0.67, 1.5)
+# Today's price x latest filed shares must land near today's market cap. If it
+# does not, the price series and the share count are on different bases and
+# every historical market value built from them is wrong by the same factor.
+NOW_BASIS_BAND = (0.6, 1.6)
+# A latest filing older than this is not the latest filing - Yahoo has missed
+# one. "Today" is then today's price over earnings from two years ago, while
+# yfinance's own twelve-month figure knows better: Craneware read 52.6x on
+# the same basis against 28.6x trailing, and passed the history screen on that
+# gap. 13 of 251 survivors (Sept 2026) had a newest filed year of 2024. Eighteen
+# months leaves room for a late filer without admitting a skipped year.
+MAX_FILING_AGE_DAYS = 548
+
+# The statements cache stores DERIVED records, not raw frames (seven years of
+# daily prices per name would be ~40x larger). So a change to
+# build_statement_record does not reach names already cached - bump this and
+# the next run refetches instead of serving numbers the new code would not
+# produce.
+STATEMENTS_CACHE_VERSION = 3
+
+
+def cagr(values: list) -> float:
+    """Compound annual growth across the span the values actually cover.
+
+    Identical to the Korea build: undefined when the base is zero or negative.
+    A company that lost money three years ago has no meaningful growth RATE,
+    and inventing one is worse than reporting nothing. The yearly figures
+    always ship alongside, so nothing is hidden by this.
+    """
+    vals = [v for v in values if v is not None and np.isfinite(v)]
+    if len(vals) < 2 or vals[0] <= 0 or vals[-1] <= 0:
+        return np.nan
+    return (vals[-1] / vals[0]) ** (1.0 / (len(vals) - 1)) - 1.0
+
+
+def major_ccy(ccy) -> tuple[str, float]:
+    """(major currency, divisor) for a Yahoo quote currency."""
+    c = str(ccy or "")
+    return MINOR_CCY.get(c, (c, 1.0))
+
+
+def _row(df: pd.DataFrame, names) -> pd.Series:
+    """First matching statement row, indexed by fiscal year-end, oldest first."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    for n in names:
+        if n in df.index:
+            s = pd.to_numeric(df.loc[n], errors="coerce")
+            s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+            return s.sort_index()
+    return pd.Series(dtype=float)
+
+
+def _at(series: pd.Series, when: pd.Timestamp, tolerance_days: int = 10) -> float:
+    """Last value on or before `when`, if it is within `tolerance_days`. A
+    fiscal year-end that falls in a data gap is missing, not the nearest price
+    from months earlier."""
+    if series is None or series.empty:
+        return np.nan
+    s = series.loc[:when].dropna()
+    if s.empty or (when - s.index[-1]).days > tolerance_days:
+        return np.nan
+    return float(s.iloc[-1])
+
+
+def _num(v) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return np.nan
+    return f if np.isfinite(f) else np.nan
+
+
+def build_statement_record(inc: pd.DataFrame, bs: pd.DataFrame,
+                           px: pd.Series, fx: pd.Series | None,
+                           quote_ccy: str, fin_ccy: str,
+                           close_now: float, mcap_now: float,
+                           fin_years: int = 3, max_hist: int = 5,
+                           asof: str | pd.Timestamp | None = None) -> dict:
+    """Everything the two statement-based features need, from raw frames.
+
+    Pure: no network, so test_uk.py can exercise every trap offline. `px` is
+    the daily close in QUOTE units (pence for a GBp line); `fx` converts the
+    quote's MAJOR currency into the reporting currency (None when they are the
+    same); `close_now` and `mcap_now` are in the quote's major currency.
+
+    Every multiple is a market value over a reported total, never a price over
+    a per-share figure. Yahoo's per-share rows are in reporting-currency units
+    against a price in pence, and its EPS row is frequently rounded to zero;
+    totals over totals sidestep both.
+
+    Three-year history: the last `fin_years` filed years, oldest first, in
+    millions of the REPORTING currency. Deliberately not converted - a growth
+    rate should describe the business, not sterling against the dollar.
+
+    Own history: for each filed year, that year-end market value over that
+    year's filed figures, converted into the reporting currency at that
+    year-end rate. Plus the latest filing's components, so the screen can put
+    TODAY's market value over them on exactly the same definitions - see
+    uk_filters.apply_history_screen for why that matters.
+    """
+    rec: dict = {"fin_ccy": fin_ccy or ""}
+
+    rows = {k: _row(inc, v) for k, v in IS_ROWS.items()}
+    rows.update({k: _row(bs, v) for k, v in BS_ROWS.items()})
+
+    # A fiscal year counts as filed when it has revenue or net income. Yahoo
+    # pads the frame with an extra, entirely empty oldest column (2021 in
+    # every UK name checked), and that must not be read as a zero year.
+    dates = sorted(set(rows["rev"].dropna().index) | set(rows["np"].dropna().index))
+    if not dates:
+        rec["hist_note"] = "no filed years"
+        return rec
+
+    # ---- three-year history ---------------------------------------------
+    fy = dates[-fin_years:]
+    rec["fin_years"] = ",".join(d.strftime("%Y") for d in fy)
+    rec["fin_n"] = len(fy)
+    for key in ("rev", "op", "ebitda", "np"):
+        series = [_num(rows[key].get(d)) / 1e6 for d in fy]
+        for i, v in enumerate(series, 1):
+            rec[f"{key}_y{i}"] = round(v, 1) if np.isfinite(v) else np.nan
+        rec[f"{key}_cagr"] = cagr(series)
+
+    # ---- own history ------------------------------------------------------
+    hy = dates[-max_hist:]
+    rec["hist_years"] = ",".join(d.strftime("%Y") for d in hy)
+    q_major, q_div = major_ccy(quote_ccy)
+    same_ccy = bool(fin_ccy) and fin_ccy == q_major
+    # No reporting currency is not the same as sterling. Assuming it would
+    # treat a dollar reporter's accounts as pounds and scale every historical
+    # multiple by the exchange rate - a fake discount or premium of 20-35%.
+    # Missing means no benchmark (invariant 2), never a guess.
+    if not fin_ccy:
+        rec["hist_note"] = "no reporting currency"
+
+    def fx_at(when):
+        if same_ccy:
+            return 1.0
+        return _at(fx, when) if fx is not None else np.nan
+
+    shares = [_num(rows["shares"].get(d)) for d in hy]
+    lf = hy[-1]
+
+    # Earnings basis for the VALUATION: normalized where Yahoo has it for
+    # every year in the window, reported otherwise - never a mix within one
+    # company's series, because a history that switches definition part-way
+    # compares a year with itself on two different measures (see IS_ROWS).
+    def pick(norm_key, rep_key):
+        n = rows[norm_key]
+        if all(np.isfinite(_num(n.get(d))) for d in hy):
+            return n, "normalized"
+        return rows[rep_key], "reported"
+    ni_row, ni_basis = pick("np_norm", "np")
+    eb_row, _ = pick("ebitda_norm", "ebitda")
+    rec["hist_earnings"] = ni_basis
+
+    # Guard 0: a stale latest filing. Checked first, because every other
+    # number in the record would be struck against it.
+    if asof is not None and "hist_note" not in rec:
+        age = (pd.Timestamp(asof).normalize() - lf).days
+        if age > MAX_FILING_AGE_DAYS:
+            rec["hist_note"] = "stale filings"
+
+    # Guard 1: a share count that jumps between filings is a corporate action.
+    # The price series is split-adjusted while filed counts are not
+    # necessarily, so a market value built across the break is wrong by the
+    # split ratio - which the screen would read as a huge discount.
+    valid = [s for s in shares if np.isfinite(s) and s > 0]
+    for a, b in zip(valid, valid[1:]):
+        if not (SHARE_BREAK_BAND[0] <= b / a <= SHARE_BREAK_BAND[1]):
+            rec["hist_note"] = "share-count break"
+            break
+
+    # Guard 2: today's price x latest filed shares against today's market cap.
+    s_lf = _num(rows["shares"].get(lf))
+    if "hist_note" not in rec and np.isfinite(s_lf) and s_lf > 0:
+        mc = _num(mcap_now)
+        ratio = (_num(close_now) * s_lf / mc) if mc else np.nan
+        if not (np.isfinite(ratio) and NOW_BASIS_BAND[0] <= ratio <= NOW_BASIS_BAND[1]):
+            rec["hist_note"] = "price/share basis mismatch"
+
+    per, pbr, evx = [], [], []
+    for d, sh in zip(hy, shares):
+        p = _at(px, d) / q_div if px is not None else np.nan
+        mv = p * sh * fx_at(d)        # year-end market value, reporting ccy
+        ni, eq = _num(ni_row.get(d)), _num(rows["equity"].get(d))
+        eb = _num(eb_row.get(d))
+        debt, cash = _num(rows["debt"].get(d)), _num(rows["cash"].get(d))
+        mi = _num(rows["mi"].get(d))
+        mi = 0.0 if not np.isfinite(mi) else mi
+        # Non-positive denominators become NaN here; bounds are applied by the
+        # screen, which is also where a loss year drops out of the benchmark.
+        per.append(mv / ni if np.isfinite(mv) and ni > 0 else np.nan)
+        pbr.append(mv / eq if np.isfinite(mv) and eq > 0 else np.nan)
+        ev = mv + debt - cash + mi
+        evx.append(ev / eb if np.isfinite(ev) and eb > 0 else np.nan)
+
+    if "hist_note" in rec:
+        per = pbr = evx = []
+    rec["hist_per"] = [round(v, 2) if np.isfinite(v) else None for v in per]
+    rec["hist_pbr"] = [round(v, 3) if np.isfinite(v) else None for v in pbr]
+    rec["hist_evx"] = [round(v, 2) if np.isfinite(v) else None for v in evx]
+
+    # Latest filing's components, for today's multiples on the same basis.
+    fx_last = np.nan
+    if same_ccy:
+        fx_last = 1.0
+    elif fx is not None and not fx.dropna().empty:
+        fx_last = float(fx.dropna().iloc[-1])
+    rec.update({
+        # On the same earnings basis as the history, or today's value would be
+        # compared across two definitions - the thing this whole design avoids.
+        "lf_ni": _num(ni_row.get(lf)), "lf_equity": _num(rows["equity"].get(lf)),
+        "lf_ebitda": _num(eb_row.get(lf)), "lf_debt": _num(rows["debt"].get(lf)),
+        "lf_cash": _num(rows["cash"].get(lf)), "lf_mi": _num(rows["mi"].get(lf)),
+        # Today's quote-major -> reporting-currency rate, carried so the screen
+        # does not have to look it up again.
+        "fx_now": fx_last,
+    })
+    rec.setdefault("hist_note", "")
+    return rec
+
+
+def _json_safe(rec: dict) -> dict:
+    out = {}
+    for k, v in rec.items():
+        if isinstance(v, (float, np.floating)):
+            out[k] = float(v) if np.isfinite(float(v)) else None
+        elif isinstance(v, np.integer):
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
+
+def fetch_statements(snap: pd.DataFrame, cfg: ScreenConfig,
+                     asof: str = "") -> pd.DataFrame:
+    """Filed statements for the size-gated survivors. Invariant 7: this is the
+    slowest work in the run, so it only ever sees names that already cleared
+    every cheap filter.
+
+    Three Yahoo calls per ticker (income statement, balance sheet, seven years
+    of daily closes) plus one FX history per foreign reporting currency, paced
+    like snapshot() and cached per session date for the same reason: a
+    throttled statement call returns an empty frame, not an error, and an
+    empty frame reads as "no history" - which quietly removes a name from the
+    third screen instead of failing loudly.
+    """
+    import yfinance as yf
+
+    tickers = snap["ticker"].tolist()
+    path = os.path.join(cfg.cache_dir,
+                        f"statements_v{STATEMENTS_CACHE_VERSION}_{asof or 'latest'}.json")
+    cached: dict = {}
+    if os.path.exists(path):
+        age_h = (time.time() - os.path.getmtime(path)) / 3600.0
+        if age_h <= cfg.cache_ttl_hours:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    cached = json.load(fh)
+            except Exception as e:
+                log.warning("  statements cache unreadable (%s), refetching", e)
+
+    # FX: one history per reporting currency that differs from the quote's.
+    pairs = set()
+    for _, r in snap.iterrows():
+        q_major, _ = major_ccy(r.get("currency"))
+        f = r.get("fin_ccy")
+        if isinstance(f, str) and f and f != q_major:
+            pairs.add((q_major, f))
+    fxs: dict = {}
+    for q, f in sorted(pairs):
+        try:
+            h = yf.Ticker(f"{q}{f}=X").history(period="7y", interval="1d")
+            s = h["Close"].copy()
+            s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+            fxs[(q, f)] = s
+            log.info("  FX history %s->%s: %d days", q, f, len(s))
+        except Exception as e:
+            log.warning("  FX history %s->%s failed: %s - those reporters get "
+                        "no own-history benchmark", q, f, e)
+
+    todo = [t for t in tickers if t not in cached]
+    rows = {t: r for t, r in snap.set_index("ticker").iterrows()}
+
+    def one(t: str):
+        if cfg.request_delay:
+            time.sleep(cfg.request_delay)
+        r = rows[t]
+        try:
+            tk = yf.Ticker(t)
+            inc, bs = tk.income_stmt, tk.balance_sheet
+            h = tk.history(period="7y", interval="1d", auto_adjust=False)
+        except Exception as e:
+            log.debug("%s statements: %s", t, e)
+            return t, None
+        if inc is None or inc.empty:
+            return t, None
+        px = pd.Series(dtype=float)
+        if h is not None and not h.empty:
+            px = h["Close"].copy()
+            px.index = pd.to_datetime(px.index).tz_localize(None).normalize()
+        q_major, _ = major_ccy(r.get("currency"))
+        f = r.get("fin_ccy") if isinstance(r.get("fin_ccy"), str) else ""
+        rec = build_statement_record(
+            inc, bs, px, fxs.get((q_major, f)), r.get("currency"), f,
+            _num(r.get("close_local")), _num(r.get("market_cap_local")),
+            asof=asof or None)
+        return t, _json_safe(rec)
+
+    if todo:
+        log.info("  statements: fetching %d tickers (%d cached)", len(todo),
+                 len(tickers) - len(todo))
+        with cf.ThreadPoolExecutor(max_workers=cfg.max_workers) as ex:
+            for n, (t, rec) in enumerate(ex.map(one, todo), 1):
+                if rec is not None:
+                    cached[t] = rec
+                if n % 50 == 0:
+                    log.info("  statements %d/%d", n, len(todo))
+        try:
+            os.makedirs(cfg.cache_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(cached, fh)
+        except Exception as e:
+            log.warning("  could not write statements cache: %s", e)
+
+    got = [t for t in tickers if t in cached]
+    log.info("  statements for %d/%d survivors", len(got), len(tickers))
+    if len(got) < 0.8 * len(tickers):
+        log.warning("  only %.0f%% have statements - Yahoo is probably "
+                    "throttling. The two statement features will be thin; "
+                    "re-run to fill the gaps from cache.",
+                    100.0 * len(got) / max(len(tickers), 1))
+    if not got:
+        return pd.DataFrame(columns=["ticker"])
+    out = pd.DataFrame([{"ticker": t, **cached[t]} for t in got])
+    for k in ("hist_per", "hist_pbr", "hist_evx"):
+        if k in out.columns:
+            out[k] = out[k].map(lambda v: v if isinstance(v, list) else [])
+    # fin_ccy also comes from the snapshot, and the snapshot's is the one kept.
+    return out.drop(columns=["fin_ccy"], errors="ignore")

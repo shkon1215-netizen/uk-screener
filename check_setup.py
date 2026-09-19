@@ -98,6 +98,31 @@ def main() -> int:
                          "every traded value 100x too small.")
         return WARN, f"ratio = {ratio:.4f} - neither 0.01 nor 1.0; investigate"
 
+    # ------------------------------------------------ filed statements
+    # Feeds the 3-year history and the own-history screen. Shell is the test
+    # case on purpose: it reports in dollars and trades in pence, so it
+    # exercises the currency conversion the history depends on.
+    @check("filed statements (3y history, own-history screen)")
+    def _():
+        import yfinance as yf
+        from providers_uk import IS_ROWS, _row
+        tk = yf.Ticker("SHEL.L")
+        fin_ccy = (tk.info or {}).get("financialCurrency")
+        inc = tk.income_stmt
+        if inc is None or inc.empty:
+            return BAD, ("SHEL.L income statement came back empty - throttled, "
+                         "or Yahoo moved the fundamentals endpoint")
+        years = _row(inc, IS_ROWS["rev"]).dropna()
+        if len(years) < 3:
+            return BAD, (f"only {len(years)} filed years of revenue; the own-history "
+                         "screen needs 3 for any benchmark")
+        if fin_ccy != "USD":
+            return WARN, (f"SHEL.L financialCurrency={fin_ccy!r}, expected 'USD'. "
+                          "If Yahoo stopped reporting it, dollar reporters will "
+                          "be treated as sterling and their history mis-scaled.")
+        return OK, (f"{len(years)} filed years "
+                    f"({years.index[0]:%Y}-{years.index[-1]:%Y}), accounts in {fin_ccy}")
+
     # ---------------------------------------------------------- roster
     @check("FTSE constituent tables (roster)")
     def _():

@@ -1,15 +1,21 @@
 # CLAUDE.md — UK (LSE) Valuation Screener
 
 Screens the London Main Market + AIM for stocks ≥20% below industry-peer median
-on P/E, P/B, EV/EBITDA. Gates: market cap ≥ USD 600M, median daily traded value
-≥ USD 4M. Ported from the Korea build; `screener.py` is unchanged maths.
+on P/E, P/B, EV/EBITDA, plus two independent screens: cheap outright, and cheap
+against the company's own filed history. Gates: market cap ≥ USD 600M, median
+daily traded value ≥ USD 4M. Ported from the Korea build and kept in step with
+it; `screener.py` is unchanged maths.
 
 ## Run order
 
 ```bash
 python test_uk.py         # offline logic check — must pass, no network needed
 python check_setup.py     # tests every live call individually, Yahoo first
-python main_uk.py -v      # full run, 2–4 minutes
+python main_uk.py -v      # full run, ~10 minutes cold, seconds from cache
+
+# the two statement-based features cost three Yahoo calls per surviving name;
+# skip either when you only want the peer and absolute screens
+python main_uk.py --no-financials --no-history -v
 
 # liquidity comes from Yahoo's averageVolume, which is a 3-month mean rather
 # than a true 60-session ADV — skip it if you want size alone to gate
@@ -45,6 +51,7 @@ build is a *silent* one — see "Likely first failures".
 | `dashboard.cmd` | Double-click launcher: starts serve.py and opens the browser. |
 | `check_setup.py` | Pre-flight diagnostic. |
 | `test_uk.py` | Offline tests with planted traps. Keep green. |
+| `sync_dashboard_from_korea.py` | Re-derives `dashboard.py` from Korea's. See "Keeping in step with Korea". |
 
 ## Invariants — do not remove without understanding why
 
@@ -106,8 +113,11 @@ build is a *silent* one — see "Likely first failures".
    names that make them representative. Missing ROE fails the gate. Default
    5%, `--min-roe 0` disables.
 
-9. **Two independent screens**, unioned into `passes_any`; `screen` records
-   which one a name cleared. Neither gates the other.
+9. **Three independent screens.** Relative (peer median), absolute
+   (`apply_absolute_screen`) and own-history (`apply_history_screen`) are
+   scored separately and unioned into `passes_any`; `screen` lists every one a
+   name cleared, joined with " + ". None gates another. Identical in structure
+   to the Korea build.
 
 10. **The absolute screen's multiples are calibrated to the UK, the quality
     floor is not.** `abs_max_pbr` 1.42 and `abs_max_ev_ebitda` 7.5 are the
@@ -190,6 +200,12 @@ build is a *silent* one — see "Likely first failures".
 - **The AIC register moves** → investment trusts reappear in the results.
   `check_setup.py` asserts four known trusts (SMT, PSH, HVPE, INPP) are
   present in the register.
+- **Statements throttled.** `fetch_statements` makes three Yahoo calls per
+  surviving name. A throttled call returns an empty frame rather than an error,
+  and an empty frame reads as "no history" - the name quietly drops out of the
+  third screen. Watch `hist_with_benchmark` in the funnel (219 of 251 on
+  2026-09-18); a run far below that was throttled, not a market where history
+  stopped existing. Re-running fills gaps from the cache.
 - **pandas 3.x** → `pip install 'pandas<3'`.
 - **yfinance returns empty `.info`** → `pip install -U yfinance`.
 
@@ -241,6 +257,109 @@ Two consequences:
    ever matters more than it does now, screen it with `--peer-keys industry`
    inside a full run rather than with `--board AIM`.
 
+## Three-year history
+
+`fetch_statements` returns revenue, operating profit, net profit and EBITDA for
+the last three filed years, oldest first, plus a compound rate per metric -
+the same shape as Korea's `fetch_financials`, so Korea's dashboard renders it
+unchanged.
+
+- **Millions of the REPORTING currency, deliberately not converted.** Shell
+  and Experian report in dollars, so their figures are in USD m and the
+  tooltip says so (`fin_ccy`). Converting to sterling would put currency moves
+  into a growth rate that should describe the business.
+- **Reported, not normalized.** This column records what happened. The
+  own-history screen uses normalized earnings for valuation (below); the two
+  are different questions.
+- **CAGR is undefined on a zero or negative base**, reported as missing rather
+  than as a number with a meaningless sign - identical to Korea. The yearly
+  figures always ship alongside it.
+- **YoY and CAGR share one control** ("Growth shown as"), as in Korea.
+- Banks have no EBITDA in Yahoo's statements, consistent with invariant 6.
+
+## Own filed history
+
+The third screen, ported from Korea's `apply_history_screen` with its rules
+intact: >= 30% below the company's own median on >= 2 of P/E, P/B and
+EV/EBITDA, plus the ROE floor. Median, not mean (invariant 4); loss years and
+out-of-bounds values drop out of the benchmark (invariant 2); EV/EBITDA
+skipped for financials (invariant 6); fewer than 3 usable years is no
+benchmark. On 2026-09-18 it found 9 names, **none of which either of the other
+two screens flags** - taking the total from 19 to 28.
+
+What had to change for the UK, each measured rather than assumed:
+
+- **Four filed years, not five.** Yahoo carries four for UK companies. Every
+  frame has a fifth, oldest column and it is empty in every name checked, so
+  it is dropped rather than read as a zero year. The dashboard says "own
+  history", not "5y".
+- **Built from totals, on one basis end to end.** Each past year is that
+  year-end's market value over that year's filed totals; today is today's
+  market value over the latest filing (`uk_filters.add_history_now`). NOT
+  yfinance's `trailingPE`, which uses twelve months including interims: for
+  Shell that is 10.5 against 15.2 on the filed-year basis, a 31% gap that
+  would read as a discount by itself. Korea learned the same lesson on
+  EV/EBITDA. The P/E and P/B columns keep yfinance's figures - they compare
+  companies with each other, not a company with itself.
+- **Dollar reporters are converted at each year-end's rate.** Shell, Rio,
+  Experian and Hikma trade in pence and report in dollars; a market value in
+  pounds over profits in dollars is off by the exchange rate. Checked:
+  Experian's and Hikma's same-basis P/E land within 10% of yfinance's own.
+- **Valuation uses Yahoo's normalized earnings.** They strip exactly its
+  "Total Unusual Items" row. Reckitt's 2025 disposal gain doubled reported net
+  income and lifted EBITDA from 3,966 to 4,760; on reported figures it passed
+  on P/E and EV/EBITDA while its P/B, which a one-off cannot move, sat only 15%
+  below history. Normalized also corrected Hikma, whose old impairments had
+  inflated its historical P/E. Used only when available for every year in the
+  window - never mixed within one company's series. It was available for all
+  251 on the reference run.
+
+Four guards refuse a benchmark rather than build a wrong one. Each is counted
+in the funnel:
+
+| guard | trigger | 2026-09-18 |
+|---|---|---|
+| `share-count break` | filed shares move outside 0.67-1.5x between years | 8 |
+| `price/share basis mismatch` | today's price x latest shares far from market cap | 2 |
+| `stale filings` | latest filing more than 18 months old | 13 |
+| `no reporting currency` | Yahoo gives no `financialCurrency` | 1 |
+
+The share breaks are all real corporate actions (Harbour Energy's
+Wintershall deal, Rathbones/Investec, Metro Bank's recapitalisation, Pinewood's
+consolidation). Stale filings are Yahoo missing a year that has been published:
+Craneware read 52.6x on the same basis against 28.6x trailing and passed on
+that gap alone. The Georgian lari reporters (TBC Bank, Lion Finance) get no
+benchmark either - Yahoo holds one day of GEL rates, directly or via USD.
+
+Known weakness, same as Korea's: 2 of 3 lets a name pass while one metric is
+meaningless. Pennon passes on a genuine EV/EBITDA discount plus a P/E history
+of [167, 138, -, 20] from years when a water utility earned almost nothing.
+The tooltip shows every year, and `hist_avg_disc` overstates it - read it.
+
+**The statements cache holds derived records**, so a change to
+`build_statement_record` does not reach cached names. Bump
+`STATEMENTS_CACHE_VERSION` whenever that function's output changes.
+
+## Keeping in step with Korea
+
+`dashboard.py` is Korea's `dashboard.py` with a fixed set of UK substitutions,
+applied by `sync_dashboard_from_korea.py`. When Korea's dashboard changes:
+
+```bash
+python sync_dashboard_from_korea.py ../Korea/dashboard.py
+```
+
+Every substitution must match exactly once; any that no longer match are
+listed and the exit code is 1. Then grep the result for Korean text, `KOSPI`,
+`PER`/`PBR` and `ticker` to catch anything Korea added that the list does not
+know about, and confirm in a browser that the page's verdict equals the Python
+funnel at default thresholds.
+
+The data side has no such shortcut - Korea's features arrive through Naver and
+WiseReport, which have no UK equivalent. Port the screen logic into
+`uk_filters.py`, rebuild the inputs from Yahoo, and measure whether the two
+sides of any comparison are on the same basis before trusting it.
+
 ## Publishing
 
 Live: https://shkon1215-netizen.github.io/uk-screener/ (AIM at `/aim.html`).
@@ -274,10 +393,15 @@ the job rather than publishing a thin universe.
 
 ## Adjustable thresholds
 
-Identical to the Korea build: the dashboard re-evaluates BOTH screens in the
-browser, every input travels with each row, and `evaluate()` mirrors
-`apply_roe_gate` and `apply_absolute_screen` including the rule that a missing
-value fails a test it is subject to. Settings persist per board in
+Identical to the Korea build: the dashboard re-evaluates ALL THREE screens in
+the browser, every input travels with each row, and `evaluate()` mirrors
+`apply_roe_gate`, `apply_absolute_screen` and `apply_history_screen` including
+the rule that a missing value fails a test it is subject to. For the history
+screen only the threshold and metric count are live; the medians, and today's
+same-basis values (`per_now`, `pbr_now`, `evx_now`, already bounded in Python),
+travel with the row. Verified 2026-09-19: 28 / 11 / 11 / 9 in the browser at
+default thresholds, identical to the Python funnel, with no row disagreeing on
+the history verdict. Settings persist per board in
 localStorage; Reset returns to the published run.
 
 Peer medians and sub-floor market caps remain NOT adjustable, for the same

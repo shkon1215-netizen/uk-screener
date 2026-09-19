@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
                    help="cost of equity %% for the fair-P/B test")
     p.add_argument("--abs-min-div", type=float, default=2.0,
                    help="absolute screen: dividend yield %% floor; 0 disables")
+    p.add_argument("--no-financials", action="store_true",
+                   help="skip the 3-year revenue/EBITDA/net-profit history")
+    p.add_argument("--no-history", action="store_true",
+                   help="skip the own-history screen")
+    p.add_argument("--hist-discount", type=float, default=0.30,
+                   help="own-history screen: discount to the filed-year median, "
+                        "0.30 = 30%%")
+    p.add_argument("--hist-min-metrics", type=int, default=2,
+                   help="own-history screen: metrics that must clear it (1-3)")
     p.add_argument("--dashboard", default="uk_dashboard.html",
                    help="self-contained HTML dashboard; pass '' to skip")
     p.add_argument("--all", action="store_true")
@@ -91,6 +100,8 @@ def main() -> int:
         abs_require_pbr_vs_roe=not a.no_abs_fair_pbr,
         abs_cost_of_equity_pct=a.coe,
         abs_min_div_yield=a.abs_min_div,
+        hist_min_discount=a.hist_discount,
+        hist_min_metrics=a.hist_min_metrics,
         peer_keys=tuple(k.strip() for k in a.peer_keys.split(",") if k.strip()),
         exclude_investment_trusts=not a.include_trusts,
         exclude_reits=not a.include_reits,
@@ -176,7 +187,22 @@ def main() -> int:
         print("Nothing cleared the size and liquidity gates.")
         return 0
 
-    # 4. screen
+    # 4. Filed statements, for the 3-year history and the own-history
+    #    screen. Three Yahoo calls per name, so it runs here - after every
+    #    cheap gate, on survivors only (invariant 7) - and one fetch serves
+    #    both features.
+    if not (a.no_financials and a.no_history):
+        from providers_uk import fetch_statements
+        log.info("fetching filed statements for %d names...", len(pre))
+        st = fetch_statements(pre, cfg, asof)
+        if len(st.columns) > 1:
+            pre = pre.merge(st, on="ticker", how="left")
+            if a.no_financials:
+                pre = pre.drop(columns=[c for c in pre.columns
+                                        if c.startswith(("rev_", "op_", "ebitda_", "np_",
+                                                         "fin_years", "fin_n"))])
+
+    # 5. screen
     res, stats = run_screen(pre, gbp_usd, cfg)
     if res.empty:
         print("Nothing survived screening.")
@@ -191,6 +217,10 @@ def main() -> int:
 
     res, absstats = UF.apply_absolute_screen(res, cfg)
     stats = {**stats, **absstats}
+
+    if not a.no_history and "hist_pbr" in res.columns:
+        res, hstats = UF.apply_history_screen(res, cfg)
+        stats = {**stats, **hstats}
 
     funnel = {**ustats, **stats}
     print("\n--- funnel ---")
@@ -235,6 +265,9 @@ def main() -> int:
             "abs_require_pbr_vs_roe": cfg.abs_require_pbr_vs_roe,
             "abs_cost_of_equity_pct": cfg.abs_cost_of_equity_pct,
             "abs_min_div_yield": cfg.abs_min_div_yield,
+            "hist_min_discount": cfg.hist_min_discount,
+            "hist_min_metrics": cfg.hist_min_metrics,
+            "hist_min_years": cfg.hist_min_years,
         },
     }
     meta_path = os.path.splitext(a.out)[0] + "_meta.json"

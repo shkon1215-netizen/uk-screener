@@ -40,6 +40,9 @@ TABLE_COLS = [
     ("mcap_musd", "Cap $m", ""), ("trailing_pe", "P/E", ""), ("price_to_book", "P/B", ""),
     ("ev_to_ebitda", "EV/EBITDA", ""), ("roe_pct", "ROE %", ""),
     ("div_yield", "Yield %", ""), ("avg_discount", "Discount", ""),
+    ("rev_cagr", "Revenue 3y", ""), ("ebitda_cagr", "EBITDA 3y", ""),
+    ("np_cagr", "Net profit 3y", ""),
+    ("hist_avg_disc", "vs own history", ""),
     ("screen", "Screen", "l"), ("metrics_passing", "Cheap on", "l"),
 ]
 
@@ -88,6 +91,33 @@ def _records(df: pd.DataFrame) -> list[dict]:
             "disc_pb": _f(r.get("price_to_book_discount"), 4),
             "disc_ev": _f(r.get("ev_to_ebitda_discount"), 4),
             "fin": bool(str(r.get("sector", "") or "").lower().find("financial") >= 0),
+            # Three-year history, oldest first, in millions of the REPORTING
+            # currency (fin_ccy), not sterling. The yearly values
+            # travel with the rate so a name whose CAGR is undefined (negative
+            # base) still shows what actually happened.
+            "fin_years": str(r.get("fin_years", "") or ""),
+            "rev": [_f(r.get(f"rev_y{i}"), 0) for i in (1, 2, 3)],
+            "ebitda": [_f(r.get(f"ebitda_y{i}"), 0) for i in (1, 2, 3)],
+            "np3": [_f(r.get(f"np_y{i}"), 0) for i in (1, 2, 3)],
+            "rev_cagr": _f(r.get("rev_cagr"), 4),
+            "ebitda_cagr": _f(r.get("ebitda_cagr"), 4),
+            "np_cagr": _f(r.get("np_cagr"), 4),
+            # Own filed history. The medians and today's values let the
+            # page re-threshold the screen; the yearly values feed the tooltip.
+            "hist_years": str(r.get("hist_years", "") or ""),
+            "evx_now": _f(r.get("evx_now")),
+            # Today's P/E and P/B on the SAME basis as the history (market
+            # value over the latest filing), which is not the basis of the
+            # trailing_pe/price_to_book columns - see add_history_now.
+            "per_now": _f(r.get("per_now")),
+            "pbr_now": _f(r.get("pbr_now")),
+            # The reporting currency the 3-year figures are in. Not the quote
+            # currency: Shell trades in pence and reports in dollars.
+            "fin_ccy": str(r.get("fin_ccy", "") or ""),
+            "h_med": {k: _f(r.get(f"hist_{k}_med")) for k in ("per", "pbr", "evx")},
+            "h_ser": {k: [_f(r.get(f"hist_{k}_y{i}")) for i in range(1, 6)]
+                      for k in ("per", "pbr", "evx")},
+            "hist_avg_disc": _f(r.get("hist_avg_disc"), 4),
             "roe_tier": str(r.get("roe_tier", "")),
             "passes": bool(r.get("passes", False)),
             "screen": str(r.get("screen", "") or ""),
@@ -202,6 +232,9 @@ def build_payload(csv_path: str, meta_path: str, boards: list | None = None) -> 
             "abs_max_ev": th.get("abs_max_ev_ebitda", 8.0),
             "coe": th.get("abs_cost_of_equity_pct", 10.0),
             "abs_min_div": th.get("abs_min_div_yield", 2.0),
+            "hist_disc": th.get("hist_min_discount", 0.30),
+            "hist_nmet": th.get("hist_min_metrics", 2),
+            "hist_years_min": th.get("hist_min_years", 3),
             "med_roe": None if pd.isna(med_roe) else round(float(med_roe), 1),
             "med_disc": None if pd.isna(med_disc) else round(float(med_disc), 4),
         },
@@ -474,6 +507,15 @@ tbody tr.miss{opacity:.55}
 .dbar u{position:relative;text-decoration:none;padding-right:2px}
 .dbar.neg u{color:var(--ink-3)}
 .na{color:var(--ink-3)}
+.grow{display:inline-flex;align-items:flex-end;gap:7px;justify-content:flex-end}
+.spark{display:inline-flex;align-items:flex-end;gap:2px;height:17px}
+.gb{display:block;width:5px;background:var(--accent);border-radius:1px;
+  align-self:flex-end}
+.gb.neg{background:var(--crit)}
+.gb.gap{height:2px;background:var(--grid)}
+.grow u{text-decoration:none;min-width:42px;text-align:right;display:inline-block}
+.grow u.up{color:var(--ink)}
+.grow u.dn{color:var(--crit)}
 .notes{display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--rule);
   padding-top:20px}
 .notes h3{font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;
@@ -537,6 +579,15 @@ _TEMPLATE = """
       <ul class="tests" id="tests"></ul>
       <div class="drops" id="absnote"></div>
     </section>
+
+    <section class="panel">
+      <div class="panel-h">
+        <h2>Cheap vs its own history</h2>
+        <span class="hint">median of 4 filed years</span>
+      </div>
+      <ul class="tests" id="htests"></ul>
+      <div class="drops" id="hnote"></div>
+    </section>
   </div>
 
   <section class="controls">
@@ -547,15 +598,24 @@ _TEMPLATE = """
     <div class="ctl">
       <label for="scr">Screen</label>
       <select id="scr">
-        <option value="">Either screen</option>
-        <option value="relative">Relative only</option>
-        <option value="absolute">Absolute only</option>
-        <option value="both">Both screens</option>
+        <option value="">Any screen</option>
+        <option value="relative">Cheap vs peers</option>
+        <option value="absolute">Cheap outright</option>
+        <option value="history">Cheap vs own history</option>
+        <option value="2">Two or more screens</option>
+        <option value="3">All three screens</option>
       </select>
     </div>
     <div class="ctl">
       <label for="brd">Board</label>
       <select id="brd"><option value="">All</option></select>
+    </div>
+    <div class="ctl">
+      <label for="gmode">Growth shown as</label>
+      <select id="gmode">
+        <option value="yoy">Year on year</option>
+        <option value="cagr">3-year CAGR</option>
+      </select>
     </div>
     <label class="toggle"><input type="checkbox" id="onlypass" checked> Passing only</label>
     <label class="toggle"><input type="checkbox" id="nohold"> Hide holdcos</label>
@@ -591,6 +651,10 @@ _TEMPLATE = """
         <input type="number" id="t_disc" step="5"></div>
       <div class="tg"><label for="t_nmet">…on at least N metrics</label>
         <input type="number" id="t_nmet" min="1" max="3" step="1"></div>
+      <div class="tg"><label for="t_hdisc">Below own history by at least %</label>
+        <input type="number" id="t_hdisc" min="0" step="5"></div>
+      <div class="tg"><label for="t_hnmet">…on at least N metrics</label>
+        <input type="number" id="t_hnmet" min="1" max="3" step="1"></div>
     </div>
     <div class="thrtoggles">
       <label class="toggle"><input type="checkbox" id="t_fair"> Require P/B below fair value</label>
@@ -611,12 +675,29 @@ _TEMPLATE = """
 
   <section class="notes">
     <h3>Read this before acting on it</h3>
-    <p><b>Two screens, deliberately independent.</b> The <b>relative</b> screen asks
-    whether a name is cheap against its own industry peers. The <b>absolute</b> screen
-    ignores the neighbours and asks whether it is cheap outright. The UK needs both:
-    a peer group where everything is expensive still produces "cheap" names, and one
-    where everything is cheap hides them. A row tagged <b>both</b> cleared each test
-    on its own terms.</p>
+    <p><b>Cheap vs its own history</b> compares today's P/E, P/B and EV/EBITDA
+    with the median of the company's last four filed years - four, not Korea's
+    five, because that is all Yahoo holds for UK companies. It catches what the
+    other two miss: a company that always traded at a premium and has just
+    de-rated. Loss years drop out of the benchmark rather than dragging it, and
+    fewer than three usable years means no benchmark at all.</p>
+    <p><b>Today's multiples in that column are not the ones in the P/E and P/B
+    columns.</b> Each past year is that year-end market value over that year's
+    filed accounts, so today is measured the same way: today's market value over
+    the latest filed year. The P/E column uses the last twelve months instead,
+    and for Shell the two differ by a third - comparing across them would report
+    the gap between two definitions as a discount. Dollar reporters are converted
+    at each year-end's rate. <b>One caution:</b> when earnings are rising, the
+    latest filing lags the price and a stock reads <i>expensive</i> against its
+    history until the next filing catches up. A one-off gain does the opposite.</p>
+    <p><b>Three screens, deliberately independent.</b> Cheap <b>vs peers</b> asks
+    whether a name trades below its industry median. Cheap <b>outright</b> ignores
+    the neighbours and asks whether it is cheap on fixed levels. Cheap <b>vs its
+    own history</b> asks whether it is cheap against itself. The UK needs all
+    three: a peer group where everything is expensive still produces "cheap"
+    names, one where everything is cheap hides them, and neither notices a
+    premium company that has quietly de-rated. None gates another; the Screen
+    column lists every one a row cleared.</p>
     <p><b>Financials qualify on a weaker bar.</b> Enterprise value is meaningless for
     a bank, so EV/EBITDA is suppressed for them — which means a strict
     both-metrics rule would exclude every bank, insurer, broker and holdco no matter
@@ -627,13 +708,13 @@ _TEMPLATE = """
     discount is this. The ROE floor removes the worst of it, but a name just
     above the line is still worth checking by hand.</p>
     <p><b>Investment trusts are excluded, and that is the biggest single
-    decision here.</b> Closed-end funds are a third of the London market by
+    decision here.</b> Closed-end funds are a fifth of the London market by
     count and trade persistently below their own stated book — a median 8%
-    discount to NAV on the day this ran — because that is what closed-end
-    funds do, not because they are mispriced. Left in, they would fill this
-    table on every run. The list comes from the AIC register, matched on
-    ticker, so operating asset managers like Schroders and Jupiter stay in
-    while Scottish Mortgage and Pershing Square come out.</p>
+    discount to NAV — because that is what closed-end funds do, not because they
+    are mispriced. Left in, they would fill this table on every run. The list
+    comes from the AIC register, matched on ticker, so operating asset managers
+    like Schroders and Jupiter stay in while Scottish Mortgage and Pershing
+    Square come out.</p>
     <p><b id="livenote"></b></p>
     <p>Peer medians are winsorized and exclude the stock itself. A metric with
     fewer than <span id="mp"></span> peers is left unscored rather than
@@ -696,14 +777,14 @@ function paintTiles() {
 const live = D.rows.filter(r => r.cap);
 const anyp = live.filter(r => r.ev.any);
 const rel = live.filter(r => r.ev.rel), absl = live.filter(r => r.ev.abs);
-const both = live.filter(r => r.ev.screen === "both");
+const hist = live.filter(r => r.ev.hist);
 const mRoe = median(anyp.map(r => r.roe_pct));
 const mDisc = median(rel.map(r => r.avg_discount));
 const capLabel = T.mcap_hi ? `$${T.mcap_lo ?? 0}m–$${T.mcap_hi}m`
                            : `$${T.mcap_lo ?? 0}m+`;
 const tiles = [
-  {k:"Passing either", v:anyp.length,
-   n:`${rel.length} relative · ${absl.length} absolute · ${both.length} both`},
+  {k:"Passing any screen", v:anyp.length,
+   n:`${rel.length} vs peers · ${absl.length} outright · ${hist.length} vs own history`},
   {k:"Median discount", v:mDisc===null?"—":(mDisc*100).toFixed(0)+"%",
    n:`relative: ${T.disc===null?"any":T.disc+"%"}+ below peers on ${T.nmet}+ metrics`},
   {k:"Median ROE", v:mRoe===null?"—":mRoe.toFixed(1)+"%",
@@ -780,6 +861,26 @@ function paintTests() {
     : "";
 }
 
+/* ---- own-history tests -------------------------------------------------- */
+function paintHistTests() {
+  const live = D.rows.filter(r => r.cap);
+  const lab = {per: "P/E", pbr: "P/B", evx: "EV/EBITDA"};
+  const lines = ["per", "pbr", "evx"].map(k => {
+    const withB = live.filter(r => r.ev.hd[k] !== null).length;
+    const pass = live.filter(r => r.ev.hd[k] !== null && r.ev.hd[k] >= T.hdisc / 100).length;
+    return `<li><span><span class="tick">✓</span>${lab[k]} ${T.hdisc}%+ below its median`
+      + ` <span style="color:var(--ink-3)">(${withB} have history)</span></span><b>${pass}</b></li>`;
+  });
+  const n = live.filter(r => r.ev.hist).length;
+  const fresh = live.filter(r => r.ev.hist && !r.ev.rel && !r.ev.abs).length;
+  $("htests").innerHTML = lines.join("")
+    + `<li class="total"><span>${T.hnmet} or more of them`
+    + (T.roe !== null ? `, ROE ${T.roe}%+` : "") + `</span><b>${n}</b></li>`;
+  $("hnote").innerHTML = n
+    ? `<span class="drop"><b>${fresh}</b> of these clear neither of the other two screens</span>`
+    : "";
+}
+
 /* Board options are rebuilt from the new data, but a selection the viewer made
    is kept when that board still exists in the refreshed run. */
 function paintBoards() {
@@ -793,13 +894,25 @@ function paintBoards() {
 
 function paintAll() {
   evaluateAll();
-  paintHeader(); paintTiles(); paintFunnel(); paintTests(); paintBoards(); render();
+  paintHeader(); paintTiles(); paintFunnel(); paintTests(); paintHistTests();
+  paintBoards(); render();
 }
 
 /* ---- table ----------------------------------------------------------- */
 const NUM = new Set(["mcap_musd","trailing_pe","price_to_book","ev_to_ebitda",
                      "roe_pct","div_yield","avg_discount"]);
 let sortKey = "avg_discount", sortDir = -1;
+let growthMode = "yoy";
+
+/* Latest year-on-year, precomputed so it can be sorted on like any column. */
+function computeGrowth() {
+  D.rows.forEach(r => {
+    Object.entries(GROWTH).forEach(([key, field]) => {
+      const steps = yoySteps(r[field] || []);
+      r[key.replace("_cagr", "_yoy")] = steps.length ? steps[steps.length - 1] : null;
+    });
+  });
+}
 
 $("thead").innerHTML = D.cols.map(c =>
   `<th class="${c.a}" data-k="${c.k}">${c.h}<span class="ar">▾</span></th>`).join("");
@@ -816,8 +929,8 @@ $("thead").querySelectorAll("th").forEach(th => th.addEventListener("click", () 
    when the run built its cohorts) and any market cap BELOW the run's floor,
    because those rows were gated out before scoring and are simply absent. */
 const THR_KEYS = ["mcap_lo","mcap_hi","pbr","ev","per","roe","div","coe",
-                  "disc","nmet","fair","carve"];
-const STORE = "kr-thresholds-" + (M.board || "x");
+                  "disc","nmet","hdisc","hnmet","fair","carve"];
+const STORE = "uk-thresholds-" + (M.board || "x");
 let T = {};
 
 function defaults() {
@@ -826,6 +939,7 @@ function defaults() {
     pbr: M.abs_max_pbr, ev: M.abs_max_ev, per: null,
     roe: M.min_roe, div: M.abs_min_div, coe: M.coe,
     disc: Math.round(M.discount * 100), nmet: M.min_metrics,
+    hdisc: Math.round((M.hist_disc ?? 0.30) * 100), hnmet: M.hist_nmet ?? 2,
     fair: true, carve: (M.n_carveout || 0) > 0 || true,
   };
 }
@@ -839,6 +953,7 @@ function readControls() {
     per: numOrNull($("t_per")), roe: numOrNull($("t_roe")),
     div: numOrNull($("t_div")), coe: numOrNull($("t_coe")) || 10,
     disc: numOrNull($("t_disc")), nmet: numOrNull($("t_nmet")) || 1,
+    hdisc: numOrNull($("t_hdisc")) ?? 30, hnmet: numOrNull($("t_hnmet")) || 1,
     fair: $("t_fair").checked, carve: $("t_carve").checked,
   };
   ["t_per","t_mcap_hi"].forEach(id => $(id).classList.toggle("off", !numOrNull($(id))));
@@ -861,6 +976,8 @@ function writeControls(v) {
   $("t_coe").value = v.coe ?? 10;
   $("t_disc").value = v.disc ?? "";
   $("t_nmet").value = v.nmet ?? 2;
+  $("t_hdisc").value = v.hdisc ?? 30;
+  $("t_hnmet").value = v.hnmet ?? 2;
   $("t_fair").checked = !!v.fair;
   $("t_carve").checked = !!v.carve;
 }
@@ -886,10 +1003,30 @@ function evaluate(r) {
   if (T.carve && r.fin && pbrOk && !evOk) { core = true; carved = true; }
   const abs = core && perOk && roeOk && divOk && fairOk;
 
-  return {rel, abs, carved,
-          screen: rel && abs ? "both" : rel ? "relative" : abs ? "absolute" : "",
-          any: rel || abs,
+  // Own filed history. Mirrors uk_filters.apply_history_screen: the
+  // benchmark medians were built in Python (loss years and out-of-bounds
+  // values already excluded), so only the threshold and count are live here.
+  const hd = histDiscounts(r);
+  const hPass = Object.values(hd).filter(d => d !== null && d >= T.hdisc / 100).length;
+  const hist = hPass >= T.hnmet && roeOk;
+
+  const on = [rel && "relative", abs && "absolute", hist && "history"].filter(Boolean);
+  return {rel, abs, hist, carved, hd, hPass,
+          screen: on.join(" + "), n: on.length, any: on.length > 0,
           tests: {pbr: pbrOk, ev: evOk, fair: fairOk, div: divOk, roe: roeOk}};
+}
+
+/* Today's value against the filed-year median, per metric. Null where there is
+   no benchmark (fewer than the minimum usable years) or no valid value today -
+   a missing value is never a cheap one (invariant 2). */
+function histDiscounts(r) {
+  const cur = {per: r.per_now, pbr: r.pbr_now, evx: r.evx_now};
+  const out = {};
+  ["per", "pbr", "evx"].forEach(k => {
+    const m = r.h_med ? r.h_med[k] : null, c = cur[k];
+    out[k] = (m && c !== null && c !== undefined && m > 0 && c > 0) ? (m - c) / m : null;
+  });
+  return out;
 }
 
 function inCap(r) {
@@ -925,13 +1062,101 @@ function discColor(d) {
 const esc = (s) => String(s).replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+/* Growth metrics and where each one's inputs live. */
+const GROWTH = {rev_cagr: "rev", ebitda_cagr: "ebitda", np_cagr: "np3"};
+const GROWTH_LABEL = {rev_cagr: "Revenue", ebitda_cagr: "EBITDA", np_cagr: "Net profit"};
+
+/* Simple period-over-period change. Unlike CAGR this stays defined when the
+   base is negative, because it needs no root: dividing by |base| gives the
+   right SIGN for the direction of travel, so a loss narrowing from -100 to
+   -50 reads +50%. That is an improvement, not a profit - the red bars and the
+   tooltip's raw figures are what stop it being read as growth. */
+function pctChange(from, to) {
+  if (from === null || from === undefined || to === null || to === undefined) return null;
+  if (from === 0) return null;
+  return (to - from) / Math.abs(from);
+}
+
+/* Year-on-year for each step in the series, oldest first. */
+function yoySteps(series) {
+  const out = [];
+  for (let i = 1; i < (series || []).length; i++) out.push(pctChange(series[i - 1], series[i]));
+  return out;
+}
+
+const fmtPct = (v) => v === null || v === undefined ? "n/a"
+  : (v >= 0 ? "+" : "") + (v * 100).toFixed(0) + "%";
+
+/* Three years as three bars plus a rate. Bars are scaled within the row's own
+   range, so they show shape, not magnitude across rows - comparing revenue
+   bars between two companies would be meaningless. A negative year is drawn as
+   a loss, and every underlying figure is in the tooltip so nothing is only a
+   picture. */
+function growthCell(r, key) {
+  const series = r[GROWTH[key]] || [];
+  const vals = series.filter(v => v !== null && v !== undefined);
+  if (!vals.length) return '<span class="na">—</span>';
+  const hi = Math.max(...vals.map(Math.abs), 1);
+  const yrs = (r.fin_years || "").split(",");
+  const steps = yoySteps(series);
+
+  const bars = series.map((v, i) => {
+    if (v === null || v === undefined) return '<i class="gb gap"></i>';
+    const h = Math.max(2, Math.round(Math.abs(v) / hi * 15));
+    return `<i class="gb ${v < 0 ? "neg" : ""}" style="height:${h}px"></i>`;
+  }).join("");
+
+  // One tooltip for the whole cell: every year, every step, and the compound
+  // rate - so whichever mode is on screen, the rest is a hover away.
+  const tip = GROWTH_LABEL[key] + " (" + (r.fin_ccy || "reporting ccy") + " m)\\n"
+    + series.map((v, i) => `${yrs[i] || "?"}: ${v === null || v === undefined ? "—" : v.toLocaleString()}`
+        + (i > 0 ? `  (${fmtPct(steps[i - 1])} YoY)` : "")).join("\\n")
+    + `\\n3y CAGR: ${r[key] === null || r[key] === undefined ? "n/a — base was zero or negative" : fmtPct(r[key])}`;
+
+  const rate = growthMode === "yoy" ? r[key.replace("_cagr", "_yoy")] : r[key];
+  const txt = rate === null || rate === undefined
+    ? '<u class="na">n/a</u>'
+    : `<u class="${rate < 0 ? "dn" : "up"}">${fmtPct(rate)}</u>`;
+  return `<span class="grow" title="${esc(tip)}"><span class="spark">${bars}</span>${txt}</span>`;
+}
+
+/* Average discount to the company's own filed-year median, across every metric
+   that has one - including the ones that failed, as avg_discount does
+   (invariant 5). The tooltip carries each metric's history, median, today's
+   value and the discount, so a single number never stands in for three. */
+function histCell(r) {
+  const hd = r.ev.hd;
+  const vals = Object.values(hd).filter(v => v !== null);
+  if (!vals.length) return '<span class="na" title="fewer than '
+    + (M.hist_years_min || 3) + ' usable years of history">—</span>';
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const yrs = (r.hist_years || "").split(",");
+  const lab = {per: "P/E", pbr: "P/B", evx: "EV/EBITDA"};
+  const now = {per: r.per_now, pbr: r.pbr_now, evx: r.evx_now};
+  const tip = ["per", "pbr", "evx"].map(k => {
+    const ser = (r.h_ser && r.h_ser[k] || []).slice(0, yrs.length).map((v, i) =>
+      (yrs[i] || "?") + " " + (v === null ? "—" : v.toFixed(1))).join(", ");
+    const med = r.h_med && r.h_med[k];
+    if (med === null || med === undefined) return lab[k] + ": no usable history";
+    return `${lab[k]}: now ${now[k] === null || now[k] === undefined ? "—" : now[k].toFixed(2)}`
+      + ` vs median ${med.toFixed(2)} → ${hd[k] === null ? "n/a" : fmtPct(-hd[k]) + " vs history"}`
+      + `\\n   ${ser}`;
+  }).join("\\n");
+  const passTag = r.ev.hist ? ' <span class="tag">hist low</span>' : "";
+  return `<span class="dbar ${avg < 0 ? "neg" : ""}" title="${esc(tip)}">`
+    + `<i style="width:${Math.max(0, Math.min(100, avg * 100))}%;background:${discColor(avg)}"></i>`
+    + `<u>${(avg * 100).toFixed(0)}%</u></span>${passTag}`;
+}
+
 function cell(r, k) {
   const v = r[k];
   /* A key present in TABLE_COLS but absent from the row payload arrives as
      undefined, which is not null and so slipped past the guard below and hit
      .toFixed() - one renamed column threw on the first row and left the whole
-     table empty with no visible error. Missing reads as missing. */
-  if (v === undefined) return '<span class="na">—</span>';
+     table empty with no visible error. Missing reads as missing. Computed
+     columns (growth, history) read other fields and are exempt. */
+  if (v === undefined && !(k in GROWTH) && k !== "hist_avg_disc"
+      && k !== "screen" && k !== "name") return '<span class="na">—</span>';
   if (k === "tidm") return `<span style="color:var(--ink-3)">${esc(v)}</span>`;
   if (k === "name") {
     const tags = (r.holdco ? '<span class="tag">holdco</span>' : "")
@@ -945,6 +1170,8 @@ function cell(r, k) {
     const star = r.ev.carved ? ' <span class="tag">pbr+roe</span>' : "";
     return `<span class="sbadge ${s}">${lab}</span>${star}`;
   }
+  if (k in GROWTH) return growthCell(r, k);
+  if (k === "hist_avg_disc") return histCell(r);
   if (k === "metrics_passing") return v ? esc(v) : '<span class="na">—</span>';
   if (k === "roe_pct") {
     if (v === null) return '<span class="na">—</span>';
@@ -968,10 +1195,12 @@ function cell(r, k) {
 /* Re-evaluated on every threshold change and cached on the row, so the tiles,
    the tests panel, the funnel tail and the table all read one verdict. */
 function evaluateAll() {
+  computeGrowth();
   D.rows.forEach(r => { r.ev = evaluate(r); r.cap = inCap(r); });
 }
 
 function render() {
+  growthMode = $("gmode").value;
   const q = $("q").value.trim().toLowerCase();
   const brd = $("brd").value;
   const onlyPass = $("onlypass").checked, noHold = $("nohold").checked;
@@ -980,7 +1209,8 @@ function render() {
   let rows = D.rows.filter(r => {
     if (!r.cap) return false;
     if (onlyPass && !r.ev.any) return false;
-    if (scr && r.ev.screen !== scr) return false;
+    if (scr === "2" || scr === "3") { if (r.ev.n < +scr) return false; }
+    else if (scr && !r.ev[{relative: "rel", absolute: "abs", history: "hist"}[scr]]) return false;
     if (noHold && r.holdco) return false;
     if (brd && r.board !== brd) return false;
     if (q && !(r.name.toLowerCase().includes(q) || (r.tidm || "").toLowerCase().includes(q)
@@ -988,8 +1218,10 @@ function render() {
     return true;
   });
 
+  const sk = (sortKey in GROWTH && growthMode === "yoy")
+    ? sortKey.replace("_cagr", "_yoy") : sortKey;
   rows.sort((a, b) => {
-    const x = a[sortKey], y = b[sortKey];
+    const x = a[sk], y = b[sk];
     if (x === null && y === null) return 0;
     if (x === null) return 1;
     if (y === null) return -1;
@@ -997,6 +1229,11 @@ function render() {
   });
 
   $("thead").querySelectorAll("th").forEach(th => {
+    const k = th.dataset.k;
+    if (k in GROWTH) {
+      th.firstChild.textContent =
+        GROWTH_LABEL[k] + (growthMode === "yoy" ? " YoY" : " 3y");
+    }
     th.classList.toggle("on", th.dataset.k === sortKey);
     const ar = th.querySelector(".ar");
     if (ar) ar.textContent = sortDir < 0 ? "▾" : "▴";
@@ -1011,7 +1248,7 @@ function render() {
     + (inCapN < D.rows.length ? ` (${D.rows.length - inCapN} outside the cap range)` : "");
 }
 
-["q","brd","scr","onlypass","nohold"].forEach(id =>
+["q","brd","scr","gmode","onlypass","nohold"].forEach(id =>
   $(id).addEventListener("input", render));
 
 /* ---- live refresh ----------------------------------------------------
