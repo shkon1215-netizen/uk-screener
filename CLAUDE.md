@@ -410,6 +410,16 @@ reasons as Korea — they cannot be recomputed from the shipped rows.
 If the client-side verdict at default settings disagrees with the Python
 funnel, that is a real bug.
 
+Every value a threshold is applied to ships at **6dp, not the 2dp the table
+displays** — `trailing_pe`, `price_to_book`, `ev_to_ebitda`, `roe_pct`,
+`div_yield`, `per_now`, `pbr_now`, `evx_now`, the per-metric discounts and the
+history medians. That is the fix Korea carries and this build inherits through
+the sync. The 28 / 11 / 11 / 9 above always agreed, but two per-test counts did
+not: Frasers at P/B 1.398222 vs fair value 1.4044 rounds to 1.40 vs 1.40 and
+drops out (35 → 34), and Genuit at ROE 4.969% rounds UP to 5.0 and passes a 5%
+floor it fails. Re-verified 2026-09-19 with the six-figure payload: every
+per-test count matches too.
+
 ## Interpretation
 
 Sort by `avg_discount`, then read `roe_pct` immediately. Low P/B + high ROE is

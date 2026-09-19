@@ -49,13 +49,15 @@ PAIRS = [
      '            # up, SHEL.L is a vendor detail. This key must stay in step with\n'
      '            # TABLE_COLS - see the guard in cell() for what a mismatch costs.\n'
      '            "tidm": str(r.get("tidm", "") or r.get("ticker", "")),\n'),
-    ('            "evx_now": _f(r.get("evx_now")),\n',
-     '            "evx_now": _f(r.get("evx_now")),\n'
+    ('            "evx_now": _f(r.get("evx_now"), 6),\n',
+     '            "evx_now": _f(r.get("evx_now"), 6),\n'
      '            # Today\'s P/E and P/B on the SAME basis as the history (market\n'
      '            # value over the latest filing), which is not the basis of the\n'
      '            # trailing_pe/price_to_book columns - see add_history_now.\n'
-     '            "per_now": _f(r.get("per_now")),\n'
-     '            "pbr_now": _f(r.get("pbr_now")),\n'
+     '            # These are what the history screen thresholds against, so\n'
+     '            # they carry full precision like the multiples above.\n'
+     '            "per_now": _f(r.get("per_now"), 6),\n'
+     '            "pbr_now": _f(r.get("pbr_now"), 6),\n'
      '            # The reporting currency the 3-year figures are in. Not the quote\n'
      '            # currency: Shell trades in pence and reports in dollars.\n'
      '            "fin_ccy": str(r.get("fin_ccy", "") or ""),\n'),
