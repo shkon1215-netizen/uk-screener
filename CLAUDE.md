@@ -243,8 +243,25 @@ Two consequences:
 
 ## Publishing
 
+Live: https://shkon1215-netizen.github.io/uk-screener/ (AIM at `/aim.html`).
+Unlisted - `noindex` plus a blanket `robots.txt` - but the repo itself is
+public, which free Pages requires. No screen output is committed; results are
+regenerated on every run.
+
 `.github/workflows/screen.yml` runs both boards at 17:00 UTC on weekdays,
 builds `site/`, and deploys to GitHub Pages. AIM is `continue-on-error`.
+
+**Yahoo does answer GitHub's runners** - confirmed on the first run,
+2026-09-19: 425 of 434 Main Market and 100 of 100 AIM tickers priced, no
+retry needed. The published Main Market page is a `--board MAIN` run, so its
+counts differ slightly from a local `BOTH` run (233 vs 251 past the size gate
+on the same close) - AIM names are simply not in it.
+
+**The first push did not trigger a run.** The workflow ignores `**.md` pushes,
+and the tip of the initial push was a README-only commit, so GitHub evaluated
+the filter against that and skipped it. It was started with
+`gh workflow run screen.yml`. Any later push that touches code triggers
+normally; a docs-only push deliberately does not.
 
 The published pages have no Refresh button — there is no Python behind static
 hosting — so `build_site.py` replaces it with the rebuild schedule. Pages are
