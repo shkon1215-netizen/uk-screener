@@ -203,6 +203,11 @@ def main() -> int:
                                                          "fin_years", "fin_n"))])
 
     # 5. screen
+    # .info per-share fields onto today's share basis where a split since
+    # the filing left them behind - see UF.restate_info_for_splits.
+    if "share_basis_g" in pre.columns:
+        pre, sstats = UF.restate_info_for_splits(pre)
+        ustats.update(sstats)
     res, stats = run_screen(pre, gbp_usd, cfg)
     if res.empty:
         print("Nothing survived screening.")

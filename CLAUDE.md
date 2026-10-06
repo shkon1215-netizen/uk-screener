@@ -336,6 +336,37 @@ meaningless. Pennon passes on a genuine EV/EBITDA discount plus a P/E history
 of [167, 138, -, 20] from years when a water utility earned almost nothing.
 The tooltip shows every year, and `hist_avg_disc` overstates it - read it.
 
+### Splits and consolidations since the latest filing
+
+Yahoo rescales its price series the day it records a split or consolidation;
+its filed share counts catch up later. Until they do, every past market value
+(price × filed shares) is off by the ratio. **Johnson Matthey** consolidated
+4-for-3 in Aug 2026: the FY2026 filing still carried 167.9m shares against
+125.9m today, the basis guard read 1.33, inside the old 0.6–1.6 band, and the
+history screen showed P/B 20% and EV/EBITDA 22% *below* its own history. On
+the true basis it is 7% above and 2% below.
+
+`build_statement_record` now takes the split events that arrive with the
+price history and, among "no change" and each suffix of the ratios since the
+filing, applies the one that explains today's market cap (`share_basis_g`) to
+every filed year — the Japan build's approach. A gap nothing explains is
+refused as before. The band is now **0.7–1.25**, measured on names with no
+split: UK 1st–99th percentile 0.75–1.07, max 1.12 (share issuance below 1 —
+IQE 0.73 — buybacks above). The old band admitted an unrestated 3:2 split or
+4:3 consolidation outright.
+
+The .info per-share fields (P/E, P/B, EPS, book value, yield) are checked the
+same way where `share_basis_g` is not 1 (`restate_info_for_splits`): filed
+equity over book value × filed shares says whether .info is on the old basis
+(restate) or the new one (keep). Yahoo is not consistent about it — JMAT's
+bookValue was already on today's shares while its statements were not — so
+it is tested, never assumed. A yield that cannot be checked after a split is
+left missing (JMAT's, on 2026-10-06). Funnel: `info_restated_for_split`,
+`info_yield_unverified`, `info_basis_unclear`.
+
+Korea was checked for the same problem and is clean: Naver restates EPS, BPS
+and DPS together (LS ELECTRIC 5:1, 코미코 2×2.5, 씨어스 3:1 all consistent).
+
 **The statements cache holds derived records**, so a change to
 `build_statement_record` does not reach cached names. Bump
 `STATEMENTS_CACHE_VERSION` whenever that function's output changes.
